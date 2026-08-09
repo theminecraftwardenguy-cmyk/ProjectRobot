@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.env
+venv/
+env/
+.venv/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ML checkpoints and large model files
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+checkpoints/*.pkl
+*.safetensors
+
+# MuJoCo
+*.mjb
+
+# Logs and outputs
+logs/
+runs/
+wandb/
+outputs/
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VSCode / IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Data
+data/
+datasets/
+*.h5
+*.hdf5
+
+# Videos/renders (can be large)
+videos/
+render/
+*.mp4
+*.gif

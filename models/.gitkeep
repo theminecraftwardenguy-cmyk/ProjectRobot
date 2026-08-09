@@ -1,0 +1,2 @@
+# Place MJCF/URDF robot XML files here
+# Example: humanoid.xml (MuJoCo's built-in is used by default in Phase 1)

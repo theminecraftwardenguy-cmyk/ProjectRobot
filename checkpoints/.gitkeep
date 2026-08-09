@@ -1,0 +1,3 @@
+# Checkpoint .pt/.zip files are gitignored (too large)
+# Upload to Kaggle Datasets or HuggingFace Hub instead
+# Only the best/ subfolder's best_model.zip is worth tracking manually
