@@ -16,7 +16,6 @@ Requires for recording:
 import argparse
 from pathlib import Path
 from datetime import datetime
-import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
@@ -40,13 +39,22 @@ def parse_args():
     return p.parse_args()
 
 
+def make_vec(render_mode, vecnorm_path, training=False):
+    """Create a single-env DummyVecEnv with optional VecNormalize."""
+    env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode=render_mode)])
+    if Path(vecnorm_path).exists():
+        env = VecNormalize.load(vecnorm_path, env)
+        print("📊 VecNormalize loaded")
+    else:
+        print("⚠️  No VecNormalize file found — observations not normalised")
+    env.training = training
+    return env
+
+
 def silent_warmup(checkpoint, vecnorm_path, warmup_steps):
     """Run warmup steps with no render window — fast."""
     print(f"⏩ Running {warmup_steps} warmup steps silently...")
-    env = DummyVecEnv([lambda: gym.make("Humanoid-v5")])
-    if Path(vecnorm_path).exists():
-        env = VecNormalize.load(vecnorm_path, env)
-    env.training = False
+    env = make_vec(None, vecnorm_path)
     model = PPO.load(checkpoint, env=env, device="cpu")
     obs = env.reset()
     for _ in range(warmup_steps):
@@ -60,14 +68,8 @@ def silent_warmup(checkpoint, vecnorm_path, warmup_steps):
 
 def run_live(checkpoint, vecnorm_path, episodes):
     """Render in a live MuJoCo window."""
-    env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="human")])
-    if Path(vecnorm_path).exists():
-        env = VecNormalize.load(vecnorm_path, env)
-    else:
-        print("⚠️  No VecNormalize file found — rendering without normalisation")
-    env.training = False
+    env = make_vec("human", vecnorm_path)
     model = PPO.load(checkpoint, env=env, device="cpu")
-
     print(f"🎬 Rendering {episodes} episode(s) live. Close window or Ctrl+C to stop.")
     obs = env.reset()
     done_count = 0
@@ -83,27 +85,17 @@ def run_live(checkpoint, vecnorm_path, episodes):
 
 
 def run_record(checkpoint, vecnorm_path, episodes, fps):
-    """Record episodes to MP4 using rgb_array render mode."""
+    """Record episodes to MP4 — single env, rgb_array mode."""
     try:
         import imageio
     except ImportError:
-        print("❌ imageio not found. Install with: pip install imageio imageio-ffmpeg")
+        print("❌ imageio not found. Run: pip install imageio imageio-ffmpeg")
         return
 
-    # Use a plain gym env for recording (rgb_array + frame capture)
-    # DummyVecEnv wraps it, but we grab frames directly from the inner env
-    inner_env = gym.make("Humanoid-v5", render_mode="rgb_array")
+    # Single env with rgb_array — policy + frames from same env, no desync
+    env = make_vec("rgb_array", vecnorm_path)
+    model = PPO.load(checkpoint, env=env, device="cpu")
 
-    # Wrap in DummyVecEnv for SB3 compatibility
-    vec_env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="rgb_array")])
-    if Path(vecnorm_path).exists():
-        vec_env = VecNormalize.load(vecnorm_path, vec_env)
-    else:
-        print("⚠️  No VecNormalize file found — recording without normalisation")
-    vec_env.training = False
-    model = PPO.load(checkpoint, env=vec_env, device="cpu")
-
-    # Output path
     videos_dir = REPO_ROOT / "videos"
     videos_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -113,32 +105,32 @@ def run_record(checkpoint, vecnorm_path, episodes, fps):
     print(f"   Saving to: {out_path}")
 
     frames = []
-    obs = vec_env.reset()
-    # Also reset inner env so it stays in sync for rendering
-    inner_obs, _ = inner_env.reset()
+    obs = env.reset()
     done_count = 0
 
     while done_count < episodes:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _, done, _ = vec_env.step(action)
-
-        # Step inner env with same action to grab rgb frame
-        inner_obs, _, inner_term, inner_trunc, _ = inner_env.step(action[0])
-        frame = inner_env.render()
+        # Grab frame BEFORE step so we capture every state
+        frame = env.render()
         if frame is not None:
+            # DummyVecEnv rgb_array returns a list of frames
+            if isinstance(frame, list):
+                frame = frame[0]
             frames.append(frame)
 
-        if inner_term or inner_trunc:
-            inner_obs, _ = inner_env.reset()
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, _ = env.step(action)
 
         if done.any():
             done_count += 1
             print(f"   Episode {done_count} done ({len(frames)} frames so far)")
             if done_count < episodes:
-                obs = vec_env.reset()
+                obs = env.reset()
 
-    vec_env.close()
-    inner_env.close()
+    env.close()
+
+    if not frames:
+        print("❌ No frames captured — something went wrong")
+        return
 
     print(f"\n💾 Writing {len(frames)} frames to video...")
     with imageio.get_writer(str(out_path), fps=fps, codec="libx264", quality=8) as writer:
