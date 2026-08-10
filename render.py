@@ -3,18 +3,20 @@
 ProjectRobot — Render trained humanoid policy
 
 Run from anywhere inside the repo:
-    python render.py
-    python render.py --checkpoint checkpoints/phase1_balance/humanoid_balance_final
-    python render.py --warmup 500   # skip first N steps before rendering
-    python render.py --episodes 3   # how many full episodes to watch
+    python render.py                        # live window, 3 episodes
+    python render.py --record               # save to videos/humanoid_<timestamp>.mp4
+    python render.py --warmup 500           # skip first N steps (skips flailing start)
+    python render.py --episodes 3           # how many full episodes
+    python render.py --record --warmup 800  # record the best-looking part
 
-The --warmup flag is the key one: it runs N steps WITHOUT rendering (instant),
-then starts the visual from that point — so you see the "trained" behaviour,
-not the flailing start.
+Requires for recording:
+    pip install imageio imageio-ffmpeg
 """
 
 import argparse
 from pathlib import Path
+from datetime import datetime
+import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
@@ -26,12 +28,119 @@ DEFAULT_CHECKPOINT = str(REPO_ROOT / "checkpoints" / "phase1_balance" / "humanoi
 def parse_args():
     p = argparse.ArgumentParser(description="Render a trained ProjectRobot policy")
     p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT,
-                   help="Path to .zip checkpoint (without extension)")
+                   help="Path to checkpoint (without .zip extension)")
     p.add_argument("--warmup", type=int, default=500,
-                   help="Steps to run silently before opening the render window (default: 500)")
+                   help="Steps to run silently before rendering (default: 500)")
     p.add_argument("--episodes", type=int, default=3,
                    help="Number of full episodes to render (default: 3)")
+    p.add_argument("--record", action="store_true",
+                   help="Save episodes as MP4 instead of showing live window")
+    p.add_argument("--fps", type=int, default=30,
+                   help="FPS for recorded video (default: 30)")
     return p.parse_args()
+
+
+def silent_warmup(checkpoint, vecnorm_path, warmup_steps):
+    """Run warmup steps with no render window — fast."""
+    print(f"⏩ Running {warmup_steps} warmup steps silently...")
+    env = DummyVecEnv([lambda: gym.make("Humanoid-v5")])
+    if Path(vecnorm_path).exists():
+        env = VecNormalize.load(vecnorm_path, env)
+    env.training = False
+    model = PPO.load(checkpoint, env=env, device="cpu")
+    obs = env.reset()
+    for _ in range(warmup_steps):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, _ = env.step(action)
+        if done.any():
+            obs = env.reset()
+    env.close()
+    print("✅ Warmup done\n")
+
+
+def run_live(checkpoint, vecnorm_path, episodes):
+    """Render in a live MuJoCo window."""
+    env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="human")])
+    if Path(vecnorm_path).exists():
+        env = VecNormalize.load(vecnorm_path, env)
+    else:
+        print("⚠️  No VecNormalize file found — rendering without normalisation")
+    env.training = False
+    model = PPO.load(checkpoint, env=env, device="cpu")
+
+    print(f"🎬 Rendering {episodes} episode(s) live. Close window or Ctrl+C to stop.")
+    obs = env.reset()
+    done_count = 0
+    while done_count < episodes:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, _ = env.step(action)
+        if done.any():
+            done_count += 1
+            print(f"   Episode {done_count} done")
+            if done_count < episodes:
+                obs = env.reset()
+    env.close()
+
+
+def run_record(checkpoint, vecnorm_path, episodes, fps):
+    """Record episodes to MP4 using rgb_array render mode."""
+    try:
+        import imageio
+    except ImportError:
+        print("❌ imageio not found. Install with: pip install imageio imageio-ffmpeg")
+        return
+
+    env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="rgb_array")])
+    if Path(vecnorm_path).exists():
+        env = VecNormalize.load(vecnorm_path, env)
+    else:
+        print("⚠️  No VecNormalize file found — recording without normalisation")
+    env.training = False
+    model = PPO.load(checkpoint, env=env, device="cpu")
+
+    # Output path
+    videos_dir = REPO_ROOT / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = videos_dir / f"humanoid_{timestamp}.mp4"
+
+    print(f"🎬 Recording {episodes} episode(s) at {fps} fps...")
+    print(f"   Saving to: {out_path}")
+
+    frames = []
+    obs = env.reset()
+    done_count = 0
+
+    # Grab first frame
+    raw_frame = env.venv.envs[0].render()
+    if raw_frame is not None:
+        frames.append(raw_frame)
+
+    while done_count < episodes:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, _ = env.step(action)
+
+        # Capture frame
+        raw_frame = env.venv.envs[0].render()
+        if raw_frame is not None:
+            frames.append(raw_frame)
+
+        if done.any():
+            done_count += 1
+            print(f"   Episode {done_count} done ({len(frames)} frames so far)")
+            if done_count < episodes:
+                obs = env.reset()
+
+    env.close()
+
+    print(f"\n💾 Writing {len(frames)} frames to video...")
+    with imageio.get_writer(str(out_path), fps=fps, codec="libx264", quality=8) as writer:
+        for frame in frames:
+            writer.append_data(frame)
+
+    size_mb = out_path.stat().st_size / 1024 / 1024
+    print(f"✅ Video saved: {out_path}  ({size_mb:.1f} MB)")
+    print(f"   Open with: open {out_path}")
 
 
 def main():
@@ -41,56 +150,20 @@ def main():
 
     print("🤖 ProjectRobot — Render Mode")
     print(f"   Checkpoint : {checkpoint}.zip")
-    print(f"   Warmup     : {args.warmup} silent steps (skips flailing start) 💨")
+    print(f"   Warmup     : {args.warmup} silent steps")
     print(f"   Episodes   : {args.episodes}")
+    print(f"   Mode       : {'record MP4' if args.record else 'live window'}")
     print()
 
-    # ── Phase 1: silent warmup (no render window, runs fast) ──────────────────
     if args.warmup > 0:
-        print(f"⏩ Running {args.warmup} warmup steps silently...")
-        warmup_env = DummyVecEnv([lambda: gym.make("Humanoid-v5")])
-        if Path(vecnorm_path).exists():
-            warmup_env = VecNormalize.load(vecnorm_path, warmup_env)
-        warmup_env.training = False
-        warmup_model = PPO.load(checkpoint, env=warmup_env, device="cpu")
-        obs = warmup_env.reset()
-        for _ in range(args.warmup):
-            action, _ = warmup_model.predict(obs, deterministic=True)
-            obs, _, done, _ = warmup_env.step(action)
-            if done.any():
-                obs = warmup_env.reset()
-        # Grab the internal mujoco state to transfer to render env
-        # (we just use the obs as starting point — render env resets fresh but
-        #  policy is already "warm" and deterministic so behaviour is consistent)
-        warmup_env.close()
-        print("✅ Warmup done — opening render window now...")
-        print()
+        silent_warmup(checkpoint, vecnorm_path, args.warmup)
 
-    # ── Phase 2: render window ──────────────────────────────────────────
-    render_env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="human")])
-    if Path(vecnorm_path).exists():
-        render_env = VecNormalize.load(vecnorm_path, render_env)
+    if args.record:
+        run_record(checkpoint, vecnorm_path, args.episodes, args.fps)
     else:
-        print("⚠️  VecNormalize file not found — rendering without normalisation (may look worse)")
-    render_env.training = False
+        run_live(checkpoint, vecnorm_path, args.episodes)
 
-    model = PPO.load(checkpoint, env=render_env, device="cpu")
-
-    episodes_done = 0
-    obs = render_env.reset()
-
-    print(f"🎬 Rendering {args.episodes} episode(s). Close the window or Ctrl+C to stop.")
-    while episodes_done < args.episodes:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, info = render_env.step(action)
-        if done.any():
-            episodes_done += 1
-            print(f"   Episode {episodes_done} done")
-            if episodes_done < args.episodes:
-                obs = render_env.reset()
-
-    render_env.close()
-    print("\n✅ Render complete!")
+    print("\n✅ Done")
 
 
 if __name__ == "__main__":
