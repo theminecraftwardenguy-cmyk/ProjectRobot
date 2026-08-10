@@ -2,17 +2,12 @@
 """
 ProjectRobot — Phase 1.5b: Get-Up Training with HumanoidStandup-v5
 
-Key difference from standup_train.py:
-  - Uses HumanoidStandup-v5 instead of Humanoid-v5
-  - Spawns humanoid LYING FLAT on the ground every episode
-  - Reward = how high the torso is (no velocity reward at all)
-  - Forces the agent to learn to GET UP from scratch every reset
-  - Auto-resumes from latest checkpoint if interrupted
+Auto-resumes from latest checkpoint. Safe to Ctrl+C and re-run anytime.
 
-Progression milestones to watch for:
+Progression milestones:
   ~5M  steps : wiggles/slides, barely gets up
   ~10M steps : starts pushing with legs, unstable standup
-  ~15M steps : can stand briefly, wobbles a lot
+  ~15M steps : can stand briefly, wobbles
   ~20M steps : holds upright posture for several seconds
 
 Run:
@@ -32,28 +27,38 @@ from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+TOTAL_STEPS = 20_000_000
+
+# Adaptive hyperparams based on how far along training is
+# The further along we are, the lower LR and tighter clip we use
+# This prevents the std explosion we saw when resuming at 10M steps
+def get_hyperparams(steps_done):
+    if steps_done < 5_000_000:
+        return dict(learning_rate=3e-4, clip_range=0.2, ent_coef=0.01)
+    elif steps_done < 10_000_000:
+        return dict(learning_rate=2e-4, clip_range=0.15, ent_coef=0.005)
+    elif steps_done < 15_000_000:
+        return dict(learning_rate=1e-4, clip_range=0.1, ent_coef=0.002)
+    else:
+        return dict(learning_rate=5e-5, clip_range=0.05, ent_coef=0.001)
+
+
 CONFIG = {
-    "env_id":        "HumanoidStandup-v5",
-    "n_envs":        4,
-    "n_steps":       2048,
-    "batch_size":    256,
-    "n_epochs":      10,
-    "gamma":         0.99,
-    "gae_lambda":    0.95,
-    "clip_range":    0.2,
-    "ent_coef":      0.005,   # reduced — less random exploration, more refinement
-    "learning_rate": 2e-4,    # slightly lower — finer updates at higher step counts
+    "env_id":      "HumanoidStandup-v5",
+    "n_envs":      4,
+    "n_steps":     2048,
+    "batch_size":  256,
+    "n_epochs":    10,
+    "gamma":       0.99,
+    "gae_lambda":  0.95,
     "max_grad_norm": 0.5,
     "policy_kwargs": dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
     ),
-    # 20M total — auto-resumes so you can run in multiple sessions
-    # e.g. run today, Ctrl+C, run again tomorrow, keeps going from where it left off
-    "total_timesteps": 20_000_000,
     "checkpoint_dir": str(REPO_ROOT / "checkpoints" / "phase1_5b_getup"),
     "log_dir":        str(REPO_ROOT / "logs" / "phase1_5b_getup"),
-    "save_freq":      100_000,   # save every 100k (less disk spam than 50k)
+    "save_freq":      100_000,
 }
 
 DEVICE = "cpu"
@@ -62,82 +67,90 @@ DEVICE = "cpu"
 def make_env(training=True):
     n = CONFIG["n_envs"] if training else 1
     env = DummyVecEnv([lambda: gym.make(CONFIG["env_id"]) for _ in range(n)])
-    env = VecNormalize(
-        env, norm_obs=True, norm_reward=training,
-        clip_obs=10.0, training=training
-    )
+    env = VecNormalize(env, norm_obs=True, norm_reward=training, clip_obs=10.0, training=training)
     return env
 
 
 def count_existing_steps():
-    """Detect how many steps we've already trained from checkpoint filenames."""
     ckpt_dir = CONFIG["checkpoint_dir"]
     if not os.path.exists(ckpt_dir):
         return 0
-    checkpoints = [
-        f for f in os.listdir(ckpt_dir)
-        if f.endswith(".zip") and "vecnorm" not in f and "final" not in f
-    ]
-    if not checkpoints:
-        return 0
-    # Filenames like humanoid_getup_5000000_steps.zip
     steps = []
-    for f in checkpoints:
-        try:
-            steps.append(int(f.split("_steps")[0].split("_")[-1]))
-        except (ValueError, IndexError):
-            pass
+    for f in os.listdir(ckpt_dir):
+        if f.endswith(".zip") and "vecnorm" not in f and "final" not in f:
+            try:
+                steps.append(int(f.split("_steps")[0].split("_")[-1]))
+            except (ValueError, IndexError):
+                pass
     return max(steps) if steps else 0
 
 
-def load_or_create(env):
+def load_or_create(env, steps_done):
     os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
     os.makedirs(CONFIG["log_dir"], exist_ok=True)
+
+    hp = get_hyperparams(steps_done)
+    print(f"🎯 Hyperparams for {steps_done:,} steps: LR={hp['learning_rate']}, clip={hp['clip_range']}, ent={hp['ent_coef']}")
+
     checkpoints = sorted([
         f for f in os.listdir(CONFIG["checkpoint_dir"])
         if f.endswith(".zip") and "vecnorm" not in f and "final" not in f
     ])
+
     if checkpoints:
         latest = os.path.join(CONFIG["checkpoint_dir"], checkpoints[-1])
         print(f"🔁 Resuming from: {latest}")
-        model = PPO.load(latest, env=env, device=DEVICE)
+        # Load with updated hyperparams — this is the key fix:
+        # we explicitly set new LR/clip so the resumed model doesn't fight old params
+        model = PPO.load(
+            latest, env=env, device=DEVICE,
+            custom_objects={
+                "learning_rate": hp["learning_rate"],
+                "clip_range": hp["clip_range"],
+                "ent_coef": hp["ent_coef"],
+                "n_steps": CONFIG["n_steps"],
+            }
+        )
         norm_path = latest.replace(".zip", "_vecnorm.pkl")
         if os.path.exists(norm_path):
             env = VecNormalize.load(norm_path, env.venv)
+            env.training = True
             print("📊 VecNormalize stats loaded")
     else:
-        print("🆕 No checkpoint found — starting fresh")
+        print("🆕 Starting fresh")
         model = PPO(
             "MlpPolicy", env, verbose=1, device=DEVICE,
             tensorboard_log=CONFIG["log_dir"],
-            n_steps=CONFIG["n_steps"], batch_size=CONFIG["batch_size"],
-            n_epochs=CONFIG["n_epochs"], gamma=CONFIG["gamma"],
-            gae_lambda=CONFIG["gae_lambda"], clip_range=CONFIG["clip_range"],
-            ent_coef=CONFIG["ent_coef"], learning_rate=CONFIG["learning_rate"],
+            n_steps=CONFIG["n_steps"],
+            batch_size=CONFIG["batch_size"],
+            n_epochs=CONFIG["n_epochs"],
+            gamma=CONFIG["gamma"],
+            gae_lambda=CONFIG["gae_lambda"],
             max_grad_norm=CONFIG["max_grad_norm"],
             policy_kwargs=CONFIG["policy_kwargs"],
+            **hp,
         )
+
     return model, env
 
 
 def main():
-    existing = count_existing_steps()
-    remaining = max(0, CONFIG["total_timesteps"] - existing)
+    steps_done = count_existing_steps()
+    remaining = max(0, TOTAL_STEPS - steps_done)
 
     print("🤖 ProjectRobot — Phase 1.5b: Get-Up Training")
-    print(f"   Env         : {CONFIG['env_id']} (spawns lying flat → must stand up)")
-    print(f"   Target      : {CONFIG['total_timesteps']:,} total steps")
-    print(f"   Done so far : {existing:,} steps")
-    print(f"   Remaining   : {remaining:,} steps")
-    print(f"   Saves to    : {CONFIG['checkpoint_dir']}")
+    print(f"   Env         : {CONFIG['env_id']}")
+    print(f"   Target      : {TOTAL_STEPS:,} total steps")
+    print(f"   Done so far : {steps_done:,} steps")
+    print(f"   Remaining   : {remaining:,} steps (~{remaining/1760/3600:.1f} hrs on M1 Air)")
     print()
 
     if remaining <= 0:
-        print("✅ Already reached target steps! To train more, increase total_timesteps in CONFIG.")
+        print("✅ Already at target! Increase TOTAL_STEPS to train more.")
         return
 
     env = make_env(training=True)
-    model, env = load_or_create(env)
+    model, env = load_or_create(env, steps_done)
 
     ckpt_cb = CheckpointCallback(
         save_freq=CONFIG["save_freq"] // CONFIG["n_envs"],
@@ -159,7 +172,7 @@ def main():
     model.learn(
         total_timesteps=remaining,
         callback=[ckpt_cb, eval_cb],
-        reset_num_timesteps=False,
+        reset_num_timesteps=True,   # always True — we track steps via filenames, not SB3
         tb_log_name="ppo_getup",
     )
     elapsed = time.time() - start
@@ -169,8 +182,8 @@ def main():
     env.save(final + "_vecnorm.pkl")
     print(f"\n✅ Session done in {elapsed/60:.1f} min")
     print(f"   Model  → {final}.zip")
-    print(f"\n💡 Peek at progress: python render.py --env HumanoidStandup-v5 --checkpoint checkpoints/phase1_5b_getup/humanoid_getup_final")
-    print(f"💡 TensorBoard    : tensorboard --logdir {CONFIG['log_dir']}")
+    print(f"\n💡 Peek  : python render.py --env HumanoidStandup-v5 --checkpoint checkpoints/phase1_5b_getup/humanoid_getup_final")
+    print(f"💡 TBoard: tensorboard --logdir {CONFIG['log_dir']}")
 
 
 if __name__ == "__main__":
