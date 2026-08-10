@@ -2,7 +2,8 @@
 """
 ProjectRobot — Phase 1.5b: Get-Up Training with HumanoidStandup-v5
 
-Auto-resumes from best_model checkpoint. Safe to Ctrl+C and re-run anytime.
+Auto-resumes from latest numbered checkpoint (most steps = most trained).
+Safe to Ctrl+C and re-run anytime.
 
 Progression milestones:
   ~5M  steps : wiggles/slides, barely gets up
@@ -38,8 +39,7 @@ CONFIG = {
     "gamma":         0.99,
     "gae_lambda":    0.95,
     "max_grad_norm": 0.5,
-    # Conservative stable hyperparams — do NOT change these between runs
-    # Changing LR/clip on resume is what caused the std explosion
+    # Locked — do NOT change between runs, changing LR/clip on resume causes std explosion
     "learning_rate": 1e-4,
     "clip_range":    0.1,
     "ent_coef":      0.002,
@@ -47,8 +47,6 @@ CONFIG = {
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
     ),
-    # Restore from best_model — this is the cleanest checkpoint before collapse
-    "restore_from":  str(REPO_ROOT / "checkpoints" / "phase1_5b_getup" / "best" / "best_model"),
     "checkpoint_dir": str(REPO_ROOT / "checkpoints" / "phase1_5b_getup"),
     "log_dir":        str(REPO_ROOT / "logs" / "phase1_5b_getup"),
     "save_freq":      100_000,
@@ -64,32 +62,52 @@ def make_env(training=True):
     return env
 
 
+def find_latest_checkpoint():
+    """Find the numbered checkpoint with the most steps."""
+    ckpt_dir = CONFIG["checkpoint_dir"]
+    if not os.path.exists(ckpt_dir):
+        return None, None
+    candidates = [
+        f for f in os.listdir(ckpt_dir)
+        if f.endswith(".zip") and "vecnorm" not in f and "final" not in f
+    ]
+    if not candidates:
+        return None, None
+    # Sort by step number embedded in filename
+    def extract_steps(fname):
+        try:
+            return int(fname.split("_steps")[0].split("_")[-1])
+        except (ValueError, IndexError):
+            return 0
+    candidates.sort(key=extract_steps)
+    latest = candidates[-1]
+    ckpt_path = os.path.join(ckpt_dir, latest.replace(".zip", ""))
+    norm_path = ckpt_path + "_vecnorm.pkl"
+    return ckpt_path, norm_path
+
+
 def load_model(env):
     os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
     os.makedirs(CONFIG["log_dir"], exist_ok=True)
 
-    restore = CONFIG["restore_from"]
-    restore_zip = restore + ".zip"
-    norm_path = restore + "_vecnorm.pkl"
+    ckpt_path, norm_path = find_latest_checkpoint()
 
-    if os.path.exists(restore_zip):
-        print(f"🔁 Loading from: {restore_zip}")
-        # CRITICAL: custom_objects locks in our hyperparams so SB3 doesn't
-        # use whatever LR/clip was baked into the checkpoint file
+    if ckpt_path:
+        print(f"🔁 Resuming from: {ckpt_path}.zip")
         model = PPO.load(
-            restore, env=env, device=DEVICE,
+            ckpt_path, env=env, device=DEVICE,
             custom_objects={
                 "learning_rate": CONFIG["learning_rate"],
                 "clip_range":    CONFIG["clip_range"],
                 "ent_coef":      CONFIG["ent_coef"],
             }
         )
-        if os.path.exists(norm_path):
+        if norm_path and os.path.exists(norm_path):
             env = VecNormalize.load(norm_path, env.venv)
             env.training = True
-            print("📊 VecNormalize loaded from best checkpoint")
+            print("📊 VecNormalize loaded")
         else:
-            print("⚠️  No vecnorm found alongside best_model — using fresh normalisation")
+            print("⚠️  No vecnorm alongside checkpoint — obs stats reset (first run is fine)")
     else:
         print("🆕 No checkpoint found — starting fresh")
         model = PPO(
@@ -120,11 +138,10 @@ def main():
     env = make_env(training=True)
     model, env = load_model(env)
 
-    # How many steps has SB3 already done internally?
     steps_done = model.num_timesteps
     remaining  = max(0, TOTAL_STEPS - steps_done)
-    print(f"   SB3 internal steps done : {steps_done:,}")
-    print(f"   Remaining               : {remaining:,} (~{remaining/1700/3600:.1f} hrs)")
+    print(f"   SB3 internal steps : {steps_done:,}")
+    print(f"   Remaining          : {remaining:,} (~{remaining/1700/3600:.1f} hrs)")
     print()
 
     if remaining <= 0:
@@ -141,18 +158,18 @@ def main():
     eval_cb = EvalCallback(
         eval_env,
         eval_freq=CONFIG["save_freq"] // CONFIG["n_envs"],
-        n_eval_episodes=5, verbose=1,
+        n_eval_episodes=5,
+        verbose=1,
         best_model_save_path=os.path.join(CONFIG["checkpoint_dir"], "best"),
-        best_model_save_freq=CONFIG["save_freq"] // CONFIG["n_envs"],
     )
 
-    print("🍳 MacBook cooking... Ctrl+C to pause, re-run to resume from best checkpoint.")
+    print("🍳 MacBook cooking... Ctrl+C to pause, re-run to resume.")
     print()
     start = time.time()
     model.learn(
         total_timesteps=remaining,
         callback=[ckpt_cb, eval_cb],
-        reset_num_timesteps=False,  # NEVER True on resume — causes std explosion
+        reset_num_timesteps=False,  # NEVER True — causes std explosion on resume
         tb_log_name="ppo_getup",
     )
     elapsed = time.time() - start
