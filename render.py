@@ -90,13 +90,18 @@ def run_record(checkpoint, vecnorm_path, episodes, fps):
         print("❌ imageio not found. Install with: pip install imageio imageio-ffmpeg")
         return
 
-    env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="rgb_array")])
+    # Use a plain gym env for recording (rgb_array + frame capture)
+    # DummyVecEnv wraps it, but we grab frames directly from the inner env
+    inner_env = gym.make("Humanoid-v5", render_mode="rgb_array")
+
+    # Wrap in DummyVecEnv for SB3 compatibility
+    vec_env = DummyVecEnv([lambda: gym.make("Humanoid-v5", render_mode="rgb_array")])
     if Path(vecnorm_path).exists():
-        env = VecNormalize.load(vecnorm_path, env)
+        vec_env = VecNormalize.load(vecnorm_path, vec_env)
     else:
         print("⚠️  No VecNormalize file found — recording without normalisation")
-    env.training = False
-    model = PPO.load(checkpoint, env=env, device="cpu")
+    vec_env.training = False
+    model = PPO.load(checkpoint, env=vec_env, device="cpu")
 
     # Output path
     videos_dir = REPO_ROOT / "videos"
@@ -108,30 +113,32 @@ def run_record(checkpoint, vecnorm_path, episodes, fps):
     print(f"   Saving to: {out_path}")
 
     frames = []
-    obs = env.reset()
+    obs = vec_env.reset()
+    # Also reset inner env so it stays in sync for rendering
+    inner_obs, _ = inner_env.reset()
     done_count = 0
-
-    # Grab first frame
-    raw_frame = env.venv.envs[0].render()
-    if raw_frame is not None:
-        frames.append(raw_frame)
 
     while done_count < episodes:
         action, _ = model.predict(obs, deterministic=True)
-        obs, _, done, _ = env.step(action)
+        obs, _, done, _ = vec_env.step(action)
 
-        # Capture frame
-        raw_frame = env.venv.envs[0].render()
-        if raw_frame is not None:
-            frames.append(raw_frame)
+        # Step inner env with same action to grab rgb frame
+        inner_obs, _, inner_term, inner_trunc, _ = inner_env.step(action[0])
+        frame = inner_env.render()
+        if frame is not None:
+            frames.append(frame)
+
+        if inner_term or inner_trunc:
+            inner_obs, _ = inner_env.reset()
 
         if done.any():
             done_count += 1
             print(f"   Episode {done_count} done ({len(frames)} frames so far)")
             if done_count < episodes:
-                obs = env.reset()
+                obs = vec_env.reset()
 
-    env.close()
+    vec_env.close()
+    inner_env.close()
 
     print(f"\n💾 Writing {len(frames)} frames to video...")
     with imageio.get_writer(str(out_path), fps=fps, codec="libx264", quality=8) as writer:
@@ -140,7 +147,7 @@ def run_record(checkpoint, vecnorm_path, episodes, fps):
 
     size_mb = out_path.stat().st_size / 1024 / 1024
     print(f"✅ Video saved: {out_path}  ({size_mb:.1f} MB)")
-    print(f"   Open with: open {out_path}")
+    print(f"   Open with: open '{out_path}'")
 
 
 def main():
