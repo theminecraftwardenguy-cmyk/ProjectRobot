@@ -2,14 +2,14 @@
 """
 ProjectRobot — Phase 1.5b: Get-Up Training with HumanoidStandup-v5
 
-Auto-resumes from latest numbered checkpoint (most steps = most trained).
-Safe to Ctrl+C and re-run anytime.
+Auto-resumes from latest numbered checkpoint. Safe to Ctrl+C and re-run anytime.
 
 Progression milestones:
   ~5M  steps : wiggles/slides, barely gets up
   ~10M steps : starts pushing with legs, unstable standup
   ~15M steps : can stand briefly, wobbles
-  ~20M steps : holds upright posture for several seconds
+  ~20M steps : holds upright, recovers from falls (DONE ✅)
+  ~35M steps : stable upright posture, clean recovery, ready for walking phase
 
 Run:
     python training/mac/standup_v2_train.py
@@ -28,7 +28,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-TOTAL_STEPS = 20_000_000
+TOTAL_STEPS = 35_000_000
 
 CONFIG = {
     "env_id":        "HumanoidStandup-v5",
@@ -39,10 +39,11 @@ CONFIG = {
     "gamma":         0.99,
     "gae_lambda":    0.95,
     "max_grad_norm": 0.5,
-    # Locked — do NOT change between runs, changing LR/clip on resume causes std explosion
-    "learning_rate": 1e-4,
+    # Refinement phase — lower LR for finer updates on already-trained weights
+    # DO NOT change between runs — causes std explosion
+    "learning_rate": 5e-5,
     "clip_range":    0.1,
-    "ent_coef":      0.002,
+    "ent_coef":      0.001,
     "policy_kwargs": dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
@@ -73,7 +74,6 @@ def find_latest_checkpoint():
     ]
     if not candidates:
         return None, None
-    # Sort by step number embedded in filename
     def extract_steps(fname):
         try:
             return int(fname.split("_steps")[0].split("_")[-1])
@@ -107,7 +107,7 @@ def load_model(env):
             env.training = True
             print("📊 VecNormalize loaded")
         else:
-            print("⚠️  No vecnorm alongside checkpoint — obs stats reset (first run is fine)")
+            print("⚠️  No vecnorm found — obs stats reset")
     else:
         print("🆕 No checkpoint found — starting fresh")
         model = PPO(
@@ -129,7 +129,7 @@ def load_model(env):
 
 
 def main():
-    print("🤖 ProjectRobot — Phase 1.5b: Get-Up Training")
+    print("🤖 ProjectRobot — Phase 1.5b Refinement: Stable Standup")
     print(f"   Env    : {CONFIG['env_id']}")
     print(f"   Target : {TOTAL_STEPS:,} total steps")
     print(f"   LR     : {CONFIG['learning_rate']} | clip: {CONFIG['clip_range']} | ent: {CONFIG['ent_coef']}")
@@ -141,7 +141,7 @@ def main():
     steps_done = model.num_timesteps
     remaining  = max(0, TOTAL_STEPS - steps_done)
     print(f"   SB3 internal steps : {steps_done:,}")
-    print(f"   Remaining          : {remaining:,} (~{remaining/1700/3600:.1f} hrs)")
+    print(f"   Remaining          : {remaining:,} (~{remaining/1800/3600:.1f} hrs)")
     print()
 
     if remaining <= 0:
