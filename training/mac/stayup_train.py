@@ -38,7 +38,8 @@ sys.path.insert(0, str(REPO_ROOT))
 SOURCE_CHECKPOINT = str(REPO_ROOT / "checkpoints" / "phase1_5b_getup" / "humanoid_getup_20M_safe_backup")
 SOURCE_VECNORM    = SOURCE_CHECKPOINT + "_vecnorm.pkl"
 
-TOTAL_STEPS = 10_000_000   # 10M on top of 20M = 30M total
+# 20M already inside the checkpoint + 10M new = 30M total
+TOTAL_STEPS = 30_000_000
 
 CONFIG = {
     "env_id":        "HumanoidStandup-v5",
@@ -63,10 +64,10 @@ CONFIG = {
 }
 
 # Reward shaping thresholds
-STAND_HEIGHT   = 1.2   # above this = standing, gets bonus
-FALL_HEIGHT    = 0.7   # below this = fallen, gets penalty
-STAND_BONUS    = 30.0  # reward per step for standing
-FALL_PENALTY   = 20.0  # penalty per step for being flat
+STAND_HEIGHT  = 1.2   # above this = standing, gets bonus
+FALL_HEIGHT   = 0.7   # below this = fallen, gets penalty
+STAND_BONUS   = 30.0  # reward per step for standing
+FALL_PENALTY  = 20.0  # penalty per step for being flat
 
 DEVICE = "cpu"
 
@@ -91,7 +92,7 @@ def make_env(training=True):
     n = CONFIG["n_envs"] if training else 1
     def _make():
         env = gym.make(CONFIG["env_id"])
-        env = StayUpWrapper(env)   # reward shaping layer
+        env = StayUpWrapper(env)
         return env
     env = DummyVecEnv([_make for _ in range(n)])
     env = VecNormalize(env, norm_obs=True, norm_reward=training, clip_obs=10.0, training=training)
@@ -163,7 +164,7 @@ def load_model(env):
 def main():
     print("🤖 ProjectRobot — Phase 1.5c: Stay-Up Reward Shaping")
     print(f"   Base       : 20M standup checkpoint")
-    print(f"   Extra steps: {TOTAL_STEPS:,}")
+    print(f"   Target     : {TOTAL_STEPS:,} total steps (20M base + 10M new)")
     print(f"   Stand bonus: +{STAND_BONUS} above {STAND_HEIGHT}m")
     print(f"   Fall penalty: -{FALL_PENALTY} below {FALL_HEIGHT}m")
     print(f"   LR         : {CONFIG['learning_rate']} | clip: {CONFIG['clip_range']}")
