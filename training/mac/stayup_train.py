@@ -171,9 +171,12 @@ class StdMonitorCallback(BaseCallback):
     """
     STD_WARN_THRESHOLD = 3.0
 
-    def _on_rollout_end(self) -> bool:
+    def _on_step(self) -> bool:
+        # Required by BaseCallback; actual work happens in _on_rollout_end
+        return True
+
+    def _on_rollout_end(self) -> None:
         try:
-            # SB3 PPO exposes the action distribution after collect_rollouts
             dist = self.model.policy.action_dist
             if dist is not None and hasattr(dist, 'distribution'):
                 mean_std = dist.distribution.stddev.mean().item()
@@ -186,7 +189,6 @@ class StdMonitorCallback(BaseCallback):
                     )
         except Exception:
             pass  # Don't crash training over monitoring
-        return True
 
 
 class PlateauStopCallback(BaseCallback):
