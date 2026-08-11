@@ -2,28 +2,22 @@
 """
 ProjectRobot — Phase 1.5c v2: Stay-Up Reward Shaping (Bulletproofed)
 
-Loads the best 5c v1 checkpoint (28M steps) and continues with:
-  - Tighter reward thresholds: +30 bonus above 1.45m (genuine standing only)
-  - Uprightness derived from torso quaternion (obs[1:5]), NOT obs[1] raw
-  - -20 penalty below 0.8m (fallen or slouching)
-  - Neutral zone 0.8-1.45m (standup transition, no interference)
+Loads the std-fixed 28M checkpoint (log_std clamped to [-2.0, 0.5]).
+Original 28M had mean policy std=5.79 with some joints at std=16.8 —
+clamping to max=0.5 (std~1.65) preserves all learned weights/behavior
+while stopping the random flailing that was masking real progress.
 
 Bulletproofing log:
-  C1   — Uprightness now derived from quaternion obs[1:5], not raw obs[1]
-  SK2  — StdMonitorCallback: warns + logs when policy std drifts above 3.0
-  SK3  — PlateauStopCallback: stops run if reward flat for 2M steps
-  FIX2 — target_kl=0.05: tighter KL circuit breaker after std explosion
-  FIX3 — LR=5e-6, clip=0.02, n_epochs=3, ent=0.0: emergency calm-down
-  FIX4 — SaveBestVecNormCallback: vecnorm saved alongside best_model.zip
-  FIX5 — reset_num_timesteps=False confirmed, optimizer mismatch patched
+  C1   — Uprightness from quaternion obs[1:5], not raw obs[1]
+  SK2  — StdMonitorCallback: warns >3.0, aborts >8.0
+  SK3  — PlateauStopCallback: stops if reward flat for 2M steps
+  FIX2 — target_kl=0.05: tight KL circuit breaker
+  FIX3 — LR=5e-6, clip=0.02, n_epochs=3, ent=0.0: calm fine-tuning
+  FIX5 — SOURCE_CHECKPOINT now points to std_fixed version
+         log_std clamped [-2.0, 0.5] — mean std 5.79 → 1.23
+         weights untouched, behavior verified via render before training
 
-Why std exploded:
-  clip_fraction=0.768 means 76% of actions were hitting the clip boundary.
-  With clip=0.05 that's tiny steps but enormous std drift. ent_coef=0.001
-  was still pushing entropy up. Emergency fix: ent=0.0, lr=5e-6, clip=0.02,
-  target_kl=0.05 (early stop much sooner), n_epochs=3 (less gradient surgery).
-
-Saves to: checkpoints/phase1_5c_stayup_v2/ (5c v1 checkpoints untouched)
+Saves to: checkpoints/phase1_5c_stayup_v2/
 
 Run:
     python training/mac/stayup_train.py
@@ -46,9 +40,10 @@ from stable_baselines3.common.callbacks import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+# FIX5: Use std-fixed checkpoint — original 28M untouched as backup
 SOURCE_CHECKPOINT = str(
     REPO_ROOT / "checkpoints" / "phase1_5c_stayup"
-    / "humanoid_stayup_28004864_steps"
+    / "humanoid_stayup_28004864_std_fixed"
 )
 SOURCE_VECNORM = str(
     REPO_ROOT / "checkpoints" / "phase1_5c_stayup"
@@ -62,14 +57,14 @@ CONFIG = {
     "n_envs":        4,
     "n_steps":       2048,
     "batch_size":    256,
-    "n_epochs":      3,        # FIX5: was 5 — fewer gradient steps per rollout
+    "n_epochs":      3,        # calm: fewer gradient steps per rollout
     "gamma":         0.99,
     "gae_lambda":    0.95,
     "max_grad_norm": 0.5,
-    "learning_rate": 5e-6,    # FIX5: was 2e-5 — 4x smaller, std was 5.81
-    "clip_range":    0.02,    # FIX5: was 0.05 — even tighter policy steps
-    "target_kl":     0.05,    # FIX5: was 0.15 — stop epochs much sooner
-    "ent_coef":      0.0,     # FIX5: was 0.001 — stop all entropy pushing
+    "learning_rate": 5e-6,    # calm: 4x smaller than original
+    "clip_range":    0.02,    # calm: tiny policy steps
+    "target_kl":     0.05,    # tight: abort epochs early
+    "ent_coef":      0.0,     # calm: no entropy pushing
     "policy_kwargs": dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
@@ -94,15 +89,16 @@ def get_uprightness(obs: np.ndarray) -> float:
 
 
 class StayUpWrapper(gym.Wrapper):
+    """
+    Reward shaping: +30 bonus when height>1.45m AND upright>0.6.
+    -20 penalty when height<0.8m.
+    Both conditions required — closes bounce-leg exploit.
+    """
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         torso_height  = obs[0]
         torso_upright = get_uprightness(obs)
-        genuinely_standing = (
-            torso_height  > STAND_HEIGHT and
-            torso_upright > UPRIGHT_THRESH
-        )
-        if genuinely_standing:
+        if torso_height > STAND_HEIGHT and torso_upright > UPRIGHT_THRESH:
             reward += STAND_BONUS
         elif torso_height < FALL_HEIGHT:
             reward -= FALL_PENALTY
@@ -110,22 +106,21 @@ class StayUpWrapper(gym.Wrapper):
 
 
 class SaveBestVecNormCallback(BaseCallback):
+    """Saves VecNormalize stats alongside best_model.zip after each eval."""
     def __init__(self, save_path: str, vec_env: VecNormalize, verbose: int = 0):
         super().__init__(verbose)
         self.save_path = save_path
         self.vec_env   = vec_env
 
     def _on_step(self) -> bool:
-        pkl_path = os.path.join(self.save_path, "best_model_vecnorm.pkl")
-        self.vec_env.save(pkl_path)
+        self.vec_env.save(os.path.join(self.save_path, "best_model_vecnorm.pkl"))
         return True
 
 
 class StdMonitorCallback(BaseCallback):
     """
-    Monitors policy std every rollout. Warns + logs to TensorBoard.
-    Raises an exception if std is catastrophically high (> 8.0) —
-    at that point continuing would corrupt the policy irreversibly.
+    Logs train/policy_std to TensorBoard every rollout.
+    Warns at >3.0, sets LR=0 at >8.0 to prevent catastrophic divergence.
     """
     STD_WARN_THRESHOLD  = 3.0
     STD_ABORT_THRESHOLD = 8.0
@@ -140,23 +135,16 @@ class StdMonitorCallback(BaseCallback):
                 mean_std = dist.distribution.stddev.mean().item()
                 self.logger.record("train/policy_std", mean_std)
                 if mean_std > self.STD_ABORT_THRESHOLD:
-                    print(
-                        f"🚨 STD CRITICAL: policy std={mean_std:.2f} — "
-                        f"aborting before policy is destroyed. "
-                        f"Reduce LR further or check reward scale."
-                    )
-                    # Force training to stop
+                    print(f"🚨 STD CRITICAL: {mean_std:.2f} — aborting (LR set to 0)")
                     self.model.learning_rate = 0.0
                 elif mean_std > self.STD_WARN_THRESHOLD:
-                    print(
-                        f"⚠️  STD WARNING: policy std={mean_std:.2f} — "
-                        f"consider reducing LR or ent_coef"
-                    )
+                    print(f"⚠️  STD WARNING: policy std={mean_std:.2f} — consider reducing LR or ent_coef")
         except Exception:
             pass
 
 
 class PlateauStopCallback(BaseCallback):
+    """Stops training if reward hasn't improved by min_delta in `patience` steps."""
     def __init__(self, patience: int = 2_000_000, min_delta: float = 50.0):
         super().__init__()
         self.patience   = patience
@@ -173,11 +161,7 @@ class PlateauStopCallback(BaseCallback):
             else:
                 self.steps_flat += self.training_env.num_envs
                 if self.steps_flat >= self.patience:
-                    print(
-                        f"🛑 Plateau detected — stopping. "
-                        f"No improvement > {self.min_delta} in "
-                        f"{self.patience:,} steps. Best: {self.best:.1f}"
-                    )
+                    print(f"🛑 Plateau — no improvement >{self.min_delta} in {self.patience:,} steps. Best: {self.best:.1f}")
                     return False
         return True
 
@@ -185,8 +169,7 @@ class PlateauStopCallback(BaseCallback):
 def is_valid_checkpoint(path: str) -> bool:
     try:
         with zipfile.ZipFile(path + ".zip", "r") as z:
-            bad = z.testzip()
-            return bad is None
+            return z.testzip() is None
     except (zipfile.BadZipFile, FileNotFoundError):
         return False
 
@@ -194,14 +177,9 @@ def is_valid_checkpoint(path: str) -> bool:
 def make_env(training: bool = True) -> VecNormalize:
     n = CONFIG["n_envs"] if training else 1
     def _make():
-        env = gym.make(CONFIG["env_id"])
-        return StayUpWrapper(env)
+        return StayUpWrapper(gym.make(CONFIG["env_id"]))
     env = DummyVecEnv([_make for _ in range(n)])
-    env = VecNormalize(
-        env, norm_obs=True, norm_reward=training,
-        clip_obs=10.0, training=training,
-    )
-    return env
+    return VecNormalize(env, norm_obs=True, norm_reward=training, clip_obs=10.0, training=training)
 
 
 def find_latest_checkpoint():
@@ -227,8 +205,7 @@ def find_latest_checkpoint():
     vecnorm_name = latest.replace(
         "humanoid_stayup_", "humanoid_stayup_vecnormalize_"
     ).replace(".zip", ".pkl")
-    norm_path = os.path.join(ckpt_dir, vecnorm_name)
-    return ckpt_path, norm_path
+    return ckpt_path, os.path.join(ckpt_dir, vecnorm_name)
 
 
 def load_model(env: VecNormalize):
@@ -246,7 +223,7 @@ def load_model(env: VecNormalize):
     }
 
     if ckpt_path and is_valid_checkpoint(ckpt_path):
-        print(f"🔁 Resuming 5c v2 from: {ckpt_path}.zip")
+        print(f"🔁 Resuming v2 from: {ckpt_path}.zip")
         model = PPO.load(ckpt_path, env=env, device=DEVICE, custom_objects=custom_objs)
         if norm_path and os.path.exists(norm_path):
             env = VecNormalize.load(norm_path, env.venv)
@@ -259,7 +236,7 @@ def load_model(env: VecNormalize):
         ckpt_path = None
 
     if not ckpt_path:
-        print(f"📦 Loading 5c v1 base (28M): {SOURCE_CHECKPOINT}.zip")
+        print(f"📦 Loading std-fixed base (28M): {SOURCE_CHECKPOINT}.zip")
         if not is_valid_checkpoint(SOURCE_CHECKPOINT):
             print("❌ Source checkpoint missing or corrupted!")
             print(f"   Expected: {SOURCE_CHECKPOINT}.zip")
@@ -276,10 +253,11 @@ def load_model(env: VecNormalize):
 
 
 def main():
-    print("🤖 ProjectRobot — Phase 1.5c v2: Stay-Up (Emergency Calm-Down Mode)")
+    print("🤖 ProjectRobot — Phase 1.5c v2: Stay-Up (std-fixed base)")
+    print(f"   Base        : std_fixed 28M (mean std 5.79 → 1.23, weights intact)")
     print(f"   Target      : {TOTAL_STEPS:,} total steps")
     print(f"   LR          : {CONFIG['learning_rate']} | clip: {CONFIG['clip_range']} | target_kl: {CONFIG['target_kl']}")
-    print(f"   n_epochs    : {CONFIG['n_epochs']} | ent_coef: {CONFIG['ent_coef']} (std explosion mitigation)")
+    print(f"   n_epochs    : {CONFIG['n_epochs']} | ent_coef: {CONFIG['ent_coef']}")
     print(f"   Stand bonus : +{STAND_BONUS} above {STAND_HEIGHT}m AND upright > {UPRIGHT_THRESH}")
     print(f"   Fall penalty: -{FALL_PENALTY} below {FALL_HEIGHT}m")
     print()
@@ -304,7 +282,6 @@ def main():
         save_vecnormalize=True,
         verbose=1,
     )
-
     best_dir   = os.path.join(CONFIG["checkpoint_dir"], "best")
     eval_env   = make_env(training=False)
     vecnorm_cb = SaveBestVecNormCallback(save_path=best_dir, vec_env=eval_env)
@@ -316,7 +293,6 @@ def main():
         best_model_save_path=best_dir,
         callback_after_eval=vecnorm_cb,
     )
-
     std_cb     = StdMonitorCallback()
     plateau_cb = PlateauStopCallback(patience=2_000_000, min_delta=50.0)
 
