@@ -9,6 +9,7 @@ Run from anywhere inside the repo:
     python render.py --warmup 500                            # skip N steps first
     python render.py --episodes 3                            # number of episodes
     python render.py --env HumanoidStandup-v5 --record       # record standup
+    python render.py --checkpoint path/to/ckpt --vecnormalize path/to/vecnorm.pkl
 
 Requires for recording:
     pip install imageio imageio-ffmpeg
@@ -36,6 +37,8 @@ def parse_args():
                    help="Which env to render (default: Humanoid-v5)")
     p.add_argument("--checkpoint", default=None,
                    help="Path to checkpoint (without .zip). Auto-detected if omitted.")
+    p.add_argument("--vecnormalize", default=None,
+                   help="Path to VecNormalize .pkl file. Auto-detected if omitted.")
     p.add_argument("--warmup", type=int, default=500,
                    help="Steps to run silently before rendering (default: 500)")
     p.add_argument("--episodes", type=int, default=3,
@@ -49,7 +52,7 @@ def parse_args():
 
 def make_vec(env_id, render_mode, vecnorm_path, training=False):
     env = DummyVecEnv([lambda: gym.make(env_id, render_mode=render_mode)])
-    if Path(vecnorm_path).exists():
+    if vecnorm_path and Path(vecnorm_path).exists():
         env = VecNormalize.load(vecnorm_path, env)
         print("📊 VecNormalize loaded")
     else:
@@ -146,7 +149,7 @@ def run_record(env_id, checkpoint, vecnorm_path, episodes, fps):
 def main():
     args = parse_args()
     checkpoint = args.checkpoint or DEFAULT_CHECKPOINTS[args.env]
-    vecnorm_path = checkpoint + "_vecnorm.pkl"
+    vecnorm_path = args.vecnormalize if args.vecnormalize else checkpoint + "_vecnorm.pkl"
 
     print("🤖 ProjectRobot — Render Mode")
     print(f"   Env        : {args.env}")
