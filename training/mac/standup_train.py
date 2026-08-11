@@ -15,6 +15,7 @@ Run:
 import os
 import sys
 import time
+import zipfile
 import torch
 import gymnasium as gym
 from pathlib import Path
@@ -37,20 +38,30 @@ CONFIG = {
     "gamma":         0.99,
     "gae_lambda":    0.95,
     "clip_range":    0.2,
-    "ent_coef":      0.005,           # less entropy — upright is a narrow target
+    "ent_coef":      0.005,
     "learning_rate": 3e-4,
     "max_grad_norm": 0.5,
     "policy_kwargs": dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
     ),
-    "total_timesteps": 3_000_000,     # 3M — upright is harder, needs more steps
+    "total_timesteps": 3_000_000,
     "checkpoint_dir": str(REPO_ROOT / "checkpoints" / "phase1_5_standup"),
     "log_dir":        str(REPO_ROOT / "logs" / "phase1_5_standup"),
     "save_freq":      50_000,
 }
 
 DEVICE = "cpu"
+
+
+def is_valid_checkpoint(path: str) -> bool:
+    """Verify checkpoint zip is not corrupted before loading."""
+    try:
+        with zipfile.ZipFile(path + ".zip", "r") as z:
+            bad = z.testzip()
+            return bad is None
+    except (zipfile.BadZipFile, FileNotFoundError):
+        return False
 
 
 def make_single_env(training=True):
@@ -71,22 +82,58 @@ def make_env(training=True):
     return env
 
 
+def find_latest_checkpoint():
+    """C2 FIX: Numeric sort — prevents alphabetic sort picking 9M over 10M."""
+    ckpt_dir = CONFIG["checkpoint_dir"]
+    if not os.path.exists(ckpt_dir):
+        return None, None
+    candidates = [
+        f for f in os.listdir(ckpt_dir)
+        if f.endswith(".zip") and "vecnorm" not in f and "final" not in f
+    ]
+    if not candidates:
+        return None, None
+
+    def extract_steps(fname):
+        try:
+            return int(fname.split("_steps")[0].split("_")[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    candidates.sort(key=extract_steps)
+    latest    = candidates[-1]
+    ckpt_path = os.path.join(ckpt_dir, latest.replace(".zip", ""))
+    norm_path = ckpt_path + "_vecnorm.pkl"
+    return ckpt_path, norm_path
+
+
 def load_or_create(env):
     os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
     os.makedirs(CONFIG["log_dir"], exist_ok=True)
-    checkpoints = sorted([
-        f for f in os.listdir(CONFIG["checkpoint_dir"])
-        if f.endswith(".zip") and "vecnorm" not in f
-    ])
-    if checkpoints:
-        latest = os.path.join(CONFIG["checkpoint_dir"], checkpoints[-1])
-        print(f"🔁 Resuming: {latest}")
-        model = PPO.load(latest, env=env, device=DEVICE)
-        norm_path = latest.replace(".zip", "_vecnorm.pkl")
-        if os.path.exists(norm_path):
+
+    ckpt_path, norm_path = find_latest_checkpoint()
+
+    # C2 FIX: pass custom_objects so LR/clip/ent are restored correctly on resume
+    custom_objs = {
+        "learning_rate": CONFIG["learning_rate"],
+        "clip_range":    CONFIG["clip_range"],
+        "ent_coef":      CONFIG["ent_coef"],
+    }
+
+    if ckpt_path and is_valid_checkpoint(ckpt_path):
+        print(f"🔁 Resuming: {ckpt_path}.zip")
+        model = PPO.load(ckpt_path, env=env, device=DEVICE, custom_objects=custom_objs)
+        if norm_path and os.path.exists(norm_path):
             env = VecNormalize.load(norm_path, env.venv)
+            env.training = True
             print("📊 VecNormalize stats loaded")
-    else:
+        else:
+            print("⚠️  No vecnorm found — obs stats reset")
+    elif ckpt_path:
+        print(f"❌ Checkpoint corrupted, skipping: {ckpt_path}.zip")
+        ckpt_path = None
+
+    if not ckpt_path:
         print("🆕 Starting fresh")
         model = PPO(
             "MlpPolicy", env, verbose=1, device=DEVICE,

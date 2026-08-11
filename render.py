@@ -16,6 +16,8 @@ Requires for recording:
 """
 
 import argparse
+import zipfile
+import sys
 from pathlib import Path
 from datetime import datetime
 import gymnasium as gym
@@ -23,11 +25,22 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
 REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_CHECKPOINTS = {
     "Humanoid-v5":        str(REPO_ROOT / "checkpoints" / "phase1_balance" / "humanoid_balance_final"),
     "HumanoidStandup-v5": str(REPO_ROOT / "checkpoints" / "phase1_5b_getup" / "humanoid_getup_final"),
 }
+
+
+def is_valid_checkpoint(path: str) -> bool:
+    """A2: Verify checkpoint zip is not corrupted before loading."""
+    try:
+        with zipfile.ZipFile(path + ".zip", "r") as z:
+            bad = z.testzip()
+            return bad is None
+    except (zipfile.BadZipFile, FileNotFoundError):
+        return False
 
 
 def parse_args():
@@ -50,8 +63,30 @@ def parse_args():
     return p.parse_args()
 
 
-def make_vec(env_id, render_mode, vecnorm_path, training=False):
-    env = DummyVecEnv([lambda: gym.make(env_id, render_mode=render_mode)])
+def make_wrapper(env_id: str, checkpoint: str, render_mode):
+    """
+    C3 FIX: Auto-detect stayup checkpoint and apply StayUpWrapper.
+    Without this, stayup checkpoints render with wrong reward distribution.
+    """
+    if "stayup" in checkpoint:
+        try:
+            from training.mac.stayup_train import StayUpWrapper
+            def _make():
+                return StayUpWrapper(gym.make(env_id, render_mode=render_mode))
+            print("🎁 StayUpWrapper applied (stayup checkpoint detected)")
+        except ImportError:
+            def _make():
+                return gym.make(env_id, render_mode=render_mode)
+            print("⚠️  Could not import StayUpWrapper — rendering without wrapper")
+    else:
+        def _make():
+            return gym.make(env_id, render_mode=render_mode)
+    return _make
+
+
+def make_vec(env_id: str, render_mode, vecnorm_path: str, checkpoint: str, training: bool = False):
+    _make = make_wrapper(env_id, checkpoint, render_mode)
+    env = DummyVecEnv([_make])
     if vecnorm_path and Path(vecnorm_path).exists():
         env = VecNormalize.load(vecnorm_path, env)
         print("📊 VecNormalize loaded")
@@ -61,25 +96,30 @@ def make_vec(env_id, render_mode, vecnorm_path, training=False):
     return env
 
 
-def silent_warmup(env_id, checkpoint, vecnorm_path, warmup_steps):
-    print(f"⏩ Running {warmup_steps} warmup steps silently...")
-    env = make_vec(env_id, None, vecnorm_path)
+def run_live(env_id: str, checkpoint: str, vecnorm_path: str, warmup: int, episodes: int):
+    """
+    A1 FIX: Single model load handles both warmup and live render.
+    Previous version loaded the model twice (warmup + live) — doubled peak RAM.
+    """
+    if not is_valid_checkpoint(checkpoint):
+        print(f"❌ Checkpoint missing or corrupted: {checkpoint}.zip")
+        return
+
+    env = make_vec(env_id, "human", vecnorm_path, checkpoint)
     model = PPO.load(checkpoint, env=env, device="cpu")
+
     obs = env.reset()
-    for _ in range(warmup_steps):
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _, done, _ = env.step(action)
-        if done.any():
-            obs = env.reset()
-    env.close()
-    print("✅ Warmup done\n")
 
+    if warmup > 0:
+        print(f"⏩ Running {warmup} warmup steps...")
+        for _ in range(warmup):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, _ = env.step(action)
+            if done.any():
+                obs = env.reset()
+        print("✅ Warmup done\n")
 
-def run_live(env_id, checkpoint, vecnorm_path, episodes):
-    env = make_vec(env_id, "human", vecnorm_path)
-    model = PPO.load(checkpoint, env=env, device="cpu")
     print(f"🎬 Rendering {episodes} episode(s) live. Close window or Ctrl+C to stop.")
-    obs = env.reset()
     done_count = 0
     while done_count < episodes:
         action, _ = model.predict(obs, deterministic=True)
@@ -92,15 +132,30 @@ def run_live(env_id, checkpoint, vecnorm_path, episodes):
     env.close()
 
 
-def run_record(env_id, checkpoint, vecnorm_path, episodes, fps):
+def run_record(env_id: str, checkpoint: str, vecnorm_path: str, warmup: int, episodes: int, fps: int):
     try:
         import imageio
     except ImportError:
         print("❌ imageio not found. Run: pip install imageio imageio-ffmpeg")
         return
 
-    env = make_vec(env_id, "rgb_array", vecnorm_path)
+    if not is_valid_checkpoint(checkpoint):
+        print(f"❌ Checkpoint missing or corrupted: {checkpoint}.zip")
+        return
+
+    env = make_vec(env_id, "rgb_array", vecnorm_path, checkpoint)
     model = PPO.load(checkpoint, env=env, device="cpu")
+
+    obs = env.reset()
+
+    if warmup > 0:
+        print(f"⏩ Running {warmup} warmup steps...")
+        for _ in range(warmup):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, done, _ = env.step(action)
+            if done.any():
+                obs = env.reset()
+        print("✅ Warmup done\n")
 
     videos_dir = REPO_ROOT / "videos"
     videos_dir.mkdir(exist_ok=True)
@@ -111,9 +166,7 @@ def run_record(env_id, checkpoint, vecnorm_path, episodes, fps):
     print(f"   Saving to: {out_path}")
 
     frames = []
-    obs = env.reset()
     done_count = 0
-
     while done_count < episodes:
         frame = env.render()
         if frame is not None:
@@ -123,7 +176,6 @@ def run_record(env_id, checkpoint, vecnorm_path, episodes, fps):
 
         action, _ = model.predict(obs, deterministic=True)
         obs, _, done, _ = env.step(action)
-
         if done.any():
             done_count += 1
             print(f"   Episode {done_count} done ({len(frames)} frames so far)")
@@ -148,7 +200,7 @@ def run_record(env_id, checkpoint, vecnorm_path, episodes, fps):
 
 def main():
     args = parse_args()
-    checkpoint = args.checkpoint or DEFAULT_CHECKPOINTS[args.env]
+    checkpoint   = args.checkpoint or DEFAULT_CHECKPOINTS[args.env]
     vecnorm_path = args.vecnormalize if args.vecnormalize else checkpoint + "_vecnorm.pkl"
 
     print("🤖 ProjectRobot — Render Mode")
@@ -159,13 +211,10 @@ def main():
     print(f"   Mode       : {'record MP4' if args.record else 'live window'}")
     print()
 
-    if args.warmup > 0:
-        silent_warmup(args.env, checkpoint, vecnorm_path, args.warmup)
-
     if args.record:
-        run_record(args.env, checkpoint, vecnorm_path, args.episodes, args.fps)
+        run_record(args.env, checkpoint, vecnorm_path, args.warmup, args.episodes, args.fps)
     else:
-        run_live(args.env, checkpoint, vecnorm_path, args.episodes)
+        run_live(args.env, checkpoint, vecnorm_path, args.warmup, args.episodes)
 
     print("\n✅ Done")
 

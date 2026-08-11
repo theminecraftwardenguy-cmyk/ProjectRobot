@@ -8,7 +8,7 @@ Progression milestones:
   ~5M  steps : wiggles/slides, barely gets up
   ~10M steps : starts pushing with legs, unstable standup
   ~15M steps : can stand briefly, wobbles
-  ~20M steps : holds upright, recovers from falls (DONE ✅)
+  ~20M steps : holds upright, recovers from falls (DONE)
   ~35M steps : stable upright posture, clean recovery, ready for walking phase
 
 Run:
@@ -18,6 +18,7 @@ Run:
 import os
 import sys
 import time
+import zipfile
 import torch
 import gymnasium as gym
 from pathlib import Path
@@ -56,15 +57,28 @@ CONFIG = {
 DEVICE = "cpu"
 
 
+def is_valid_checkpoint(path: str) -> bool:
+    """Verify checkpoint zip is not corrupted before loading."""
+    try:
+        with zipfile.ZipFile(path + ".zip", "r") as z:
+            bad = z.testzip()
+            return bad is None
+    except (zipfile.BadZipFile, FileNotFoundError):
+        return False
+
+
 def make_env(training=True):
+    """SK1 FIX: Use def _make() factory — avoids lambda closure bug."""
     n = CONFIG["n_envs"] if training else 1
-    env = DummyVecEnv([lambda: gym.make(CONFIG["env_id"]) for _ in range(n)])
+    def _make():
+        return gym.make(CONFIG["env_id"])
+    env = DummyVecEnv([_make for _ in range(n)])
     env = VecNormalize(env, norm_obs=True, norm_reward=training, clip_obs=10.0, training=training)
     return env
 
 
 def find_latest_checkpoint():
-    """Find the numbered checkpoint with the most steps."""
+    """Numeric sort — prevents alphabetic sort picking 9M over 10M."""
     ckpt_dir = CONFIG["checkpoint_dir"]
     if not os.path.exists(ckpt_dir):
         return None, None
@@ -74,13 +88,15 @@ def find_latest_checkpoint():
     ]
     if not candidates:
         return None, None
+
     def extract_steps(fname):
         try:
             return int(fname.split("_steps")[0].split("_")[-1])
         except (ValueError, IndexError):
             return 0
+
     candidates.sort(key=extract_steps)
-    latest = candidates[-1]
+    latest    = candidates[-1]
     ckpt_path = os.path.join(ckpt_dir, latest.replace(".zip", ""))
     norm_path = ckpt_path + "_vecnorm.pkl"
     return ckpt_path, norm_path
@@ -92,23 +108,27 @@ def load_model(env):
 
     ckpt_path, norm_path = find_latest_checkpoint()
 
-    if ckpt_path:
+    # Pass custom_objects so LR/clip/ent are restored correctly on resume
+    custom_objs = {
+        "learning_rate": CONFIG["learning_rate"],
+        "clip_range":    CONFIG["clip_range"],
+        "ent_coef":      CONFIG["ent_coef"],
+    }
+
+    if ckpt_path and is_valid_checkpoint(ckpt_path):
         print(f"🔁 Resuming from: {ckpt_path}.zip")
-        model = PPO.load(
-            ckpt_path, env=env, device=DEVICE,
-            custom_objects={
-                "learning_rate": CONFIG["learning_rate"],
-                "clip_range":    CONFIG["clip_range"],
-                "ent_coef":      CONFIG["ent_coef"],
-            }
-        )
+        model = PPO.load(ckpt_path, env=env, device=DEVICE, custom_objects=custom_objs)
         if norm_path and os.path.exists(norm_path):
             env = VecNormalize.load(norm_path, env.venv)
             env.training = True
             print("📊 VecNormalize loaded")
         else:
             print("⚠️  No vecnorm found — obs stats reset")
-    else:
+    elif ckpt_path:
+        print(f"❌ Checkpoint corrupted, skipping: {ckpt_path}.zip")
+        ckpt_path = None
+
+    if not ckpt_path:
         print("🆕 No checkpoint found — starting fresh")
         model = PPO(
             "MlpPolicy", env, verbose=1, device=DEVICE,
