@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-ProjectRobot — Phase 1.5d: Curriculum Spawning + Exponential Reward
+ProjectRobot — Phase 1.5d: Curriculum Spawning + Exponential Reward (Anti-Exploit)
 
-Key changes from 1.5c v2:
-  CURR1 — CurriculumWrapper: spawns robot at random height 1.0–1.6m
-           so it accidentally experiences standing and gets reward signal
-  EXP1  — Exponential reward R(h,u) = Rmax * exp(-lambda*(h-h*)^2) * [u>0.6]
-           replaces binary +30 cliff — smooth gradient, no exploitable edge
-  EXP2  — Fall penalty -20 below 0.8m retained as hard floor
-  HP1   — clip loosened 0.02->0.05, lr 5e-6->1e-5: more room to escape plateau
-  FIX5  — tb log dir patched: tensorboard_log set explicitly on PPO.load
+FIX (2026-08-12): The exponential reward only checked instantaneous height +
+upright every frame, with no penalty for velocity. PPO found the cheap
+exploit: launch upward violently, clip through h=1.55m for a single frame,
+harvest near-peak reward mid-flight, then crash-land and ignore recovery.
+This explains why eval/mean_reward kept climbing (127k+) while the actual
+behavior got worse — hands not bracing, violent jumps, crashing, sometimes
+getting stuck on the ground unable to recover for the rest of the episode.
 
-Reward shape:
-  R(h, u) = 40.0 * exp(-3.0 * (h - 1.55)^2)   if upright > 0.6
-           -20.0                                  if h < 0.8m
-            0                                     otherwise
-
-Curriculum:
-  - 70% chance: spawn normally (floor)
-  - 30% chance: inject qpos[2] = uniform(1.0, 1.6) before reset
-  - Gradually shifts to normal spawning as training progresses
+Three changes kill this:
+  SUSTAIN1 — the exponential bonus now ramps in linearly over
+             SUSTAIN_STEPS consecutive frames spent above SUSTAIN_HEIGHT_MIN.
+             A single-frame bounce-through nets ~0 bonus; only genuinely
+             holding a standing posture ramps to full reward.
+  VEL1     — a velocity penalty (VEL_PENALTY_COEF * qvel_z^2) is subtracted
+             whenever the robot is inside the reward zone, directly punishing
+             fast ballistic motion through the target height.
+  STUCK1   — if torso height stays below FALL_HEIGHT for more than
+             STUCK_PATIENCE consecutive steps, the episode now terminates
+             early instead of burning the remaining budget lying on the floor.
 
 Base: std_fixed 28M checkpoint (mean std 1.23)
 Target: 52,000,000 total steps (28M base + 24M new)
@@ -65,8 +66,8 @@ CONFIG = {
     "gamma":         0.99,
     "gae_lambda":    0.95,
     "max_grad_norm": 0.5,
-    "learning_rate": 1e-5,    # HP1: loosened from 5e-6, more room to escape plateau
-    "clip_range":    0.05,    # HP1: loosened from 0.02
+    "learning_rate": 1e-5,
+    "clip_range":    0.05,
     "target_kl":     0.05,
     "ent_coef":      0.0,
     "policy_kwargs": dict(
@@ -78,60 +79,40 @@ CONFIG = {
     "save_freq":      100_000,
 }
 
-# Reward params
-STAND_HEIGHT_TARGET = 1.55   # peak of exponential
-STAND_LAMBDA        = 3.0    # sharpness: ~0 reward beyond +-0.8m from peak
-STAND_RMAX          = 40.0   # peak bonus at exactly h*
+STAND_HEIGHT_TARGET = 1.55
+STAND_LAMBDA        = 3.0
+STAND_RMAX          = 40.0
 FALL_HEIGHT         = 0.8
 FALL_PENALTY        = 20.0
 UPRIGHT_THRESH      = 0.6
 
-# Curriculum params
-CURR_HEIGHT_MIN     = 1.0    # min spawn height injection
-CURR_HEIGHT_MAX     = 1.6    # max spawn height injection
-CURR_PROB_INIT      = 0.30   # 30% curriculum spawns at start
-CURR_PROB_FINAL     = 0.05   # fade to 5% by end (robot should stand on its own)
-CURR_FADE_STEPS     = 10_000_000  # steps over which to fade curriculum
+SUSTAIN_HEIGHT_MIN  = 1.3
+SUSTAIN_STEPS       = 15
+
+VEL_PENALTY_COEF    = 0.15
+
+STUCK_PATIENCE      = 30
+
+CURR_HEIGHT_MIN     = 1.0
+CURR_HEIGHT_MAX     = 1.6
+CURR_PROB_INIT      = 0.30
+CURR_PROB_FINAL     = 0.05
+CURR_FADE_STEPS     = 10_000_000
 
 DEVICE = "cpu"
 
 
 def get_uprightness(obs: np.ndarray) -> float:
-    """Derive torso uprightness from quaternion obs[1:5]."""
     qw, qx, qy, qz = obs[1], obs[2], obs[3], obs[4]
     return float(1.0 - 2.0 * (qx * qx + qy * qy))
 
 
-def exponential_stand_reward(torso_height: float, torso_upright: float) -> float:
-    """
-    R(h, u) = Rmax * exp(-lambda * (h - h*)^2)   if upright > threshold
-             -fall_penalty                         if h < fall_height
-              0                                    otherwise
-    Smooth gradient toward standing height, no exploitable cliff.
-    """
-    if torso_height < FALL_HEIGHT:
-        return -FALL_PENALTY
-    if torso_upright > UPRIGHT_THRESH:
-        return STAND_RMAX * np.exp(-STAND_LAMBDA * (torso_height - STAND_HEIGHT_TARGET) ** 2)
-    return 0.0
-
-
 class CurriculumStayUpWrapper(gym.Wrapper):
-    """
-    Combines curriculum spawning + exponential reward shaping.
-
-    Curriculum: with probability curr_prob, injects a random torso height
-    into qpos[2] at reset so the robot spawns mid-standup. This forces it
-    to experience the standing reward signal it would never reach from floor.
-
-    curr_prob fades from CURR_PROB_INIT -> CURR_PROB_FINAL over CURR_FADE_STEPS
-    so the robot eventually has to stand up on its own.
-    """
-    def __init__(self, env, total_steps_ref=None):
+    def __init__(self, env):
         super().__init__(env)
         self._steps = 0
-        self._curriculum_resets = 0
-        self._total_resets = 0
+        self._sustain_counter = 0
+        self._stuck_counter = 0
 
     def _curr_prob(self) -> float:
         t = min(self._steps / CURR_FADE_STEPS, 1.0)
@@ -139,9 +120,9 @@ class CurriculumStayUpWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self._total_resets += 1
+        self._sustain_counter = 0
+        self._stuck_counter = 0
         if np.random.random() < self._curr_prob():
-            # Inject standing height into qpos[2] (torso z)
             try:
                 qpos = self.env.unwrapped.data.qpos.copy()
                 qpos[2] = np.random.uniform(CURR_HEIGHT_MIN, CURR_HEIGHT_MAX)
@@ -149,17 +130,48 @@ class CurriculumStayUpWrapper(gym.Wrapper):
                 import mujoco
                 mujoco.mj_forward(self.env.unwrapped.model, self.env.unwrapped.data)
                 obs = self.env.unwrapped._get_obs()
-                self._curriculum_resets += 1
             except Exception:
-                pass  # fall back to normal reset silently
+                pass
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         self._steps += 1
+
         torso_height  = obs[0]
         torso_upright = get_uprightness(obs)
-        reward += exponential_stand_reward(torso_height, torso_upright)
+
+        if torso_height < FALL_HEIGHT:
+            self._stuck_counter += 1
+        else:
+            self._stuck_counter = 0
+        if self._stuck_counter > STUCK_PATIENCE:
+            terminated = True
+
+        if torso_height < FALL_HEIGHT:
+            reward += -FALL_PENALTY
+            self._sustain_counter = 0
+        elif torso_upright > UPRIGHT_THRESH:
+            if torso_height >= SUSTAIN_HEIGHT_MIN:
+                self._sustain_counter = min(self._sustain_counter + 1, SUSTAIN_STEPS)
+            else:
+                self._sustain_counter = 0
+
+            sustain_frac = self._sustain_counter / SUSTAIN_STEPS
+            base_bonus = STAND_RMAX * np.exp(
+                -STAND_LAMBDA * (torso_height - STAND_HEIGHT_TARGET) ** 2
+            )
+
+            try:
+                qvel_z = float(self.env.unwrapped.data.qvel[2])
+            except Exception:
+                qvel_z = 0.0
+            vel_penalty = VEL_PENALTY_COEF * (qvel_z ** 2)
+
+            reward += max(0.0, base_bonus * sustain_frac - vel_penalty)
+        else:
+            self._sustain_counter = 0
+
         return obs, reward, terminated, truncated, info
 
 
@@ -272,7 +284,7 @@ def load_model(env: VecNormalize):
         "ent_coef":      CONFIG["ent_coef"],
         "target_kl":     CONFIG["target_kl"],
         "n_epochs":      CONFIG["n_epochs"],
-        "tensorboard_log": CONFIG["log_dir"],  # FIX5: explicit log dir on load
+        "tensorboard_log": CONFIG["log_dir"],
     }
 
     if ckpt_path and is_valid_checkpoint(ckpt_path):
@@ -301,12 +313,15 @@ def load_model(env: VecNormalize):
 
 
 def main():
-    print("🤖 ProjectRobot — Phase 1.5d: Curriculum + Exponential Reward")
+    print("🤖 ProjectRobot — Phase 1.5d: Curriculum + Anti-Exploit Reward")
     print(f"   Base        : std_fixed 28M (mean std 1.23)")
     print(f"   Target      : {TOTAL_STEPS:,} total steps")
     print(f"   LR          : {CONFIG['learning_rate']} | clip: {CONFIG['clip_range']} | target_kl: {CONFIG['target_kl']}")
-    print(f"   Reward      : Rmax={STAND_RMAX} * exp(-{STAND_LAMBDA}*(h-{STAND_HEIGHT_TARGET})^2) if upright>{UPRIGHT_THRESH}")
+    print(f"   Reward      : Rmax={STAND_RMAX} * exp(-{STAND_LAMBDA}*(h-{STAND_HEIGHT_TARGET})^2) * sustain_frac - vel_penalty")
+    print(f"   Sustain     : {SUSTAIN_STEPS} frames above {SUSTAIN_HEIGHT_MIN}m for full bonus")
+    print(f"   Vel penalty : {VEL_PENALTY_COEF} * qvel_z^2 (kills ballistic jump exploit)")
     print(f"   Fall penalty: -{FALL_PENALTY} below {FALL_HEIGHT}m")
+    print(f"   Stuck term. : episode ends after {STUCK_PATIENCE} consecutive steps below {FALL_HEIGHT}m")
     print(f"   Curriculum  : {int(CURR_PROB_INIT*100)}% -> {int(CURR_PROB_FINAL*100)}% height injection over {CURR_FADE_STEPS:,} steps")
     print()
 
