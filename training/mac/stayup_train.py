@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-ProjectRobot — Phase 1.5c v2: Stay-Up Reward Shaping (Bulletproofed)
+ProjectRobot — Phase 1.5d: Curriculum Spawning + Exponential Reward
 
-Loads the std-fixed 28M checkpoint (log_std clamped to [-2.0, 0.5]).
-Original 28M had mean policy std=5.79 with some joints at std=16.8 —
-clamping to max=0.5 (std~1.65) preserves all learned weights/behavior
-while stopping the random flailing that was masking real progress.
+Key changes from 1.5c v2:
+  CURR1 — CurriculumWrapper: spawns robot at random height 1.0–1.6m
+           so it accidentally experiences standing and gets reward signal
+  EXP1  — Exponential reward R(h,u) = Rmax * exp(-lambda*(h-h*)^2) * [u>0.6]
+           replaces binary +30 cliff — smooth gradient, no exploitable edge
+  EXP2  — Fall penalty -20 below 0.8m retained as hard floor
+  HP1   — clip loosened 0.02->0.05, lr 5e-6->1e-5: more room to escape plateau
+  FIX5  — tb log dir patched: tensorboard_log set explicitly on PPO.load
 
-Bulletproofing log:
-  C1   — Uprightness from quaternion obs[1:5], not raw obs[1]
-  SK2  — StdMonitorCallback: warns >3.0, aborts >8.0
-  SK3  — PlateauStopCallback: stops if reward flat for 2M steps
-  FIX2 — target_kl=0.05: tight KL circuit breaker
-  FIX3 — LR=5e-6, clip=0.02, n_epochs=3, ent=0.0: calm fine-tuning
-  FIX5 — SOURCE_CHECKPOINT now points to std_fixed version
-         log_std clamped [-2.0, 0.5] — mean std 5.79 → 1.23
-         weights untouched, behavior verified via render before training
+Reward shape:
+  R(h, u) = 40.0 * exp(-3.0 * (h - 1.55)^2)   if upright > 0.6
+           -20.0                                  if h < 0.8m
+            0                                     otherwise
 
-Saves to: checkpoints/phase1_5c_stayup_v2/
+Curriculum:
+  - 70% chance: spawn normally (floor)
+  - 30% chance: inject qpos[2] = uniform(1.0, 1.6) before reset
+  - Gradually shifts to normal spawning as training progresses
+
+Base: std_fixed 28M checkpoint (mean std 1.23)
+Target: 52,000,000 total steps (28M base + 24M new)
 
 Run:
     python training/mac/stayup_train.py
@@ -40,7 +45,6 @@ from stable_baselines3.common.callbacks import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-# FIX5: Use std-fixed checkpoint — original 28M untouched as backup
 SOURCE_CHECKPOINT = str(
     REPO_ROOT / "checkpoints" / "phase1_5c_stayup"
     / "humanoid_stayup_28004864_std_fixed"
@@ -50,63 +54,116 @@ SOURCE_VECNORM = str(
     / "humanoid_stayup_vecnormalize_28004864_steps.pkl"
 )
 
-TOTAL_STEPS = 40_000_000
+TOTAL_STEPS = 52_000_000
 
 CONFIG = {
     "env_id":        "HumanoidStandup-v5",
     "n_envs":        4,
     "n_steps":       2048,
     "batch_size":    256,
-    "n_epochs":      3,        # calm: fewer gradient steps per rollout
+    "n_epochs":      3,
     "gamma":         0.99,
     "gae_lambda":    0.95,
     "max_grad_norm": 0.5,
-    "learning_rate": 5e-6,    # calm: 4x smaller than original
-    "clip_range":    0.02,    # calm: tiny policy steps
-    "target_kl":     0.05,    # tight: abort epochs early
-    "ent_coef":      0.0,     # calm: no entropy pushing
+    "learning_rate": 1e-5,    # HP1: loosened from 5e-6, more room to escape plateau
+    "clip_range":    0.05,    # HP1: loosened from 0.02
+    "target_kl":     0.05,
+    "ent_coef":      0.0,
     "policy_kwargs": dict(
         net_arch=dict(pi=[256, 256], vf=[256, 256]),
         activation_fn=torch.nn.Tanh,
     ),
-    "checkpoint_dir": str(REPO_ROOT / "checkpoints" / "phase1_5c_stayup_v2"),
-    "log_dir":        str(REPO_ROOT / "logs" / "phase1_5c_stayup_v2"),
+    "checkpoint_dir": str(REPO_ROOT / "checkpoints" / "phase1_5d_stayup"),
+    "log_dir":        str(REPO_ROOT / "logs" / "phase1_5d_stayup"),
     "save_freq":      100_000,
 }
 
-STAND_HEIGHT   = 1.45
-FALL_HEIGHT    = 0.8
-UPRIGHT_THRESH = 0.6
-STAND_BONUS    = 30.0
-FALL_PENALTY   = 20.0
+# Reward params
+STAND_HEIGHT_TARGET = 1.55   # peak of exponential
+STAND_LAMBDA        = 3.0    # sharpness: ~0 reward beyond +-0.8m from peak
+STAND_RMAX          = 40.0   # peak bonus at exactly h*
+FALL_HEIGHT         = 0.8
+FALL_PENALTY        = 20.0
+UPRIGHT_THRESH      = 0.6
+
+# Curriculum params
+CURR_HEIGHT_MIN     = 1.0    # min spawn height injection
+CURR_HEIGHT_MAX     = 1.6    # max spawn height injection
+CURR_PROB_INIT      = 0.30   # 30% curriculum spawns at start
+CURR_PROB_FINAL     = 0.05   # fade to 5% by end (robot should stand on its own)
+CURR_FADE_STEPS     = 10_000_000  # steps over which to fade curriculum
 
 DEVICE = "cpu"
 
 
 def get_uprightness(obs: np.ndarray) -> float:
+    """Derive torso uprightness from quaternion obs[1:5]."""
     qw, qx, qy, qz = obs[1], obs[2], obs[3], obs[4]
     return float(1.0 - 2.0 * (qx * qx + qy * qy))
 
 
-class StayUpWrapper(gym.Wrapper):
+def exponential_stand_reward(torso_height: float, torso_upright: float) -> float:
     """
-    Reward shaping: +30 bonus when height>1.45m AND upright>0.6.
-    -20 penalty when height<0.8m.
-    Both conditions required — closes bounce-leg exploit.
+    R(h, u) = Rmax * exp(-lambda * (h - h*)^2)   if upright > threshold
+             -fall_penalty                         if h < fall_height
+              0                                    otherwise
+    Smooth gradient toward standing height, no exploitable cliff.
     """
+    if torso_height < FALL_HEIGHT:
+        return -FALL_PENALTY
+    if torso_upright > UPRIGHT_THRESH:
+        return STAND_RMAX * np.exp(-STAND_LAMBDA * (torso_height - STAND_HEIGHT_TARGET) ** 2)
+    return 0.0
+
+
+class CurriculumStayUpWrapper(gym.Wrapper):
+    """
+    Combines curriculum spawning + exponential reward shaping.
+
+    Curriculum: with probability curr_prob, injects a random torso height
+    into qpos[2] at reset so the robot spawns mid-standup. This forces it
+    to experience the standing reward signal it would never reach from floor.
+
+    curr_prob fades from CURR_PROB_INIT -> CURR_PROB_FINAL over CURR_FADE_STEPS
+    so the robot eventually has to stand up on its own.
+    """
+    def __init__(self, env, total_steps_ref=None):
+        super().__init__(env)
+        self._steps = 0
+        self._curriculum_resets = 0
+        self._total_resets = 0
+
+    def _curr_prob(self) -> float:
+        t = min(self._steps / CURR_FADE_STEPS, 1.0)
+        return CURR_PROB_INIT + t * (CURR_PROB_FINAL - CURR_PROB_INIT)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._total_resets += 1
+        if np.random.random() < self._curr_prob():
+            # Inject standing height into qpos[2] (torso z)
+            try:
+                qpos = self.env.unwrapped.data.qpos.copy()
+                qpos[2] = np.random.uniform(CURR_HEIGHT_MIN, CURR_HEIGHT_MAX)
+                self.env.unwrapped.data.qpos[:] = qpos
+                import mujoco
+                mujoco.mj_forward(self.env.unwrapped.model, self.env.unwrapped.data)
+                obs = self.env.unwrapped._get_obs()
+                self._curriculum_resets += 1
+            except Exception:
+                pass  # fall back to normal reset silently
+        return obs, info
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._steps += 1
         torso_height  = obs[0]
         torso_upright = get_uprightness(obs)
-        if torso_height > STAND_HEIGHT and torso_upright > UPRIGHT_THRESH:
-            reward += STAND_BONUS
-        elif torso_height < FALL_HEIGHT:
-            reward -= FALL_PENALTY
+        reward += exponential_stand_reward(torso_height, torso_upright)
         return obs, reward, terminated, truncated, info
 
 
 class SaveBestVecNormCallback(BaseCallback):
-    """Saves VecNormalize stats alongside best_model.zip after each eval."""
     def __init__(self, save_path: str, vec_env: VecNormalize, verbose: int = 0):
         super().__init__(verbose)
         self.save_path = save_path
@@ -118,10 +175,6 @@ class SaveBestVecNormCallback(BaseCallback):
 
 
 class StdMonitorCallback(BaseCallback):
-    """
-    Logs train/policy_std to TensorBoard every rollout.
-    Warns at >3.0, sets LR=0 at >8.0 to prevent catastrophic divergence.
-    """
     STD_WARN_THRESHOLD  = 3.0
     STD_ABORT_THRESHOLD = 8.0
 
@@ -135,16 +188,15 @@ class StdMonitorCallback(BaseCallback):
                 mean_std = dist.distribution.stddev.mean().item()
                 self.logger.record("train/policy_std", mean_std)
                 if mean_std > self.STD_ABORT_THRESHOLD:
-                    print(f"🚨 STD CRITICAL: {mean_std:.2f} — aborting (LR set to 0)")
+                    print(f"🚨 STD CRITICAL: {mean_std:.2f} — setting LR=0")
                     self.model.learning_rate = 0.0
                 elif mean_std > self.STD_WARN_THRESHOLD:
-                    print(f"⚠️  STD WARNING: policy std={mean_std:.2f} — consider reducing LR or ent_coef")
+                    print(f"⚠️  STD WARNING: policy std={mean_std:.2f}")
         except Exception:
             pass
 
 
 class PlateauStopCallback(BaseCallback):
-    """Stops training if reward hasn't improved by min_delta in `patience` steps."""
     def __init__(self, patience: int = 2_000_000, min_delta: float = 50.0):
         super().__init__()
         self.patience   = patience
@@ -161,7 +213,7 @@ class PlateauStopCallback(BaseCallback):
             else:
                 self.steps_flat += self.training_env.num_envs
                 if self.steps_flat >= self.patience:
-                    print(f"🛑 Plateau — no improvement >{self.min_delta} in {self.patience:,} steps. Best: {self.best:.1f}")
+                    print(f"🛑 Plateau — best: {self.best:.1f}, stopping.")
                     return False
         return True
 
@@ -177,7 +229,7 @@ def is_valid_checkpoint(path: str) -> bool:
 def make_env(training: bool = True) -> VecNormalize:
     n = CONFIG["n_envs"] if training else 1
     def _make():
-        return StayUpWrapper(gym.make(CONFIG["env_id"]))
+        return CurriculumStayUpWrapper(gym.make(CONFIG["env_id"]))
     env = DummyVecEnv([_make for _ in range(n)])
     return VecNormalize(env, norm_obs=True, norm_reward=training, clip_obs=10.0, training=training)
 
@@ -220,46 +272,42 @@ def load_model(env: VecNormalize):
         "ent_coef":      CONFIG["ent_coef"],
         "target_kl":     CONFIG["target_kl"],
         "n_epochs":      CONFIG["n_epochs"],
+        "tensorboard_log": CONFIG["log_dir"],  # FIX5: explicit log dir on load
     }
 
     if ckpt_path and is_valid_checkpoint(ckpt_path):
-        print(f"🔁 Resuming v2 from: {ckpt_path}.zip")
+        print(f"🔁 Resuming 5d from: {ckpt_path}.zip")
         model = PPO.load(ckpt_path, env=env, device=DEVICE, custom_objects=custom_objs)
         if norm_path and os.path.exists(norm_path):
             env = VecNormalize.load(norm_path, env.venv)
             env.training = True
-            print("📊 VecNormalize loaded (v2 checkpoint)")
-        else:
-            print("⚠️  No vecnorm for v2 checkpoint")
+            print("📊 VecNormalize loaded (5d checkpoint)")
     elif ckpt_path:
-        print(f"❌ Checkpoint corrupted, skipping: {ckpt_path}.zip")
+        print(f"❌ Checkpoint corrupted: {ckpt_path}.zip")
         ckpt_path = None
 
     if not ckpt_path:
         print(f"📦 Loading std-fixed base (28M): {SOURCE_CHECKPOINT}.zip")
         if not is_valid_checkpoint(SOURCE_CHECKPOINT):
             print("❌ Source checkpoint missing or corrupted!")
-            print(f"   Expected: {SOURCE_CHECKPOINT}.zip")
             sys.exit(1)
         model = PPO.load(SOURCE_CHECKPOINT, env=env, device=DEVICE, custom_objects=custom_objs)
         if os.path.exists(SOURCE_VECNORM):
             env = VecNormalize.load(SOURCE_VECNORM, env.venv)
             env.training = True
             print("📊 VecNormalize loaded (28M source)")
-        else:
-            print("⚠️  No vecnorm found for source checkpoint")
 
     return model, env
 
 
 def main():
-    print("🤖 ProjectRobot — Phase 1.5c v2: Stay-Up (std-fixed base)")
-    print(f"   Base        : std_fixed 28M (mean std 5.79 → 1.23, weights intact)")
+    print("🤖 ProjectRobot — Phase 1.5d: Curriculum + Exponential Reward")
+    print(f"   Base        : std_fixed 28M (mean std 1.23)")
     print(f"   Target      : {TOTAL_STEPS:,} total steps")
     print(f"   LR          : {CONFIG['learning_rate']} | clip: {CONFIG['clip_range']} | target_kl: {CONFIG['target_kl']}")
-    print(f"   n_epochs    : {CONFIG['n_epochs']} | ent_coef: {CONFIG['ent_coef']}")
-    print(f"   Stand bonus : +{STAND_BONUS} above {STAND_HEIGHT}m AND upright > {UPRIGHT_THRESH}")
+    print(f"   Reward      : Rmax={STAND_RMAX} * exp(-{STAND_LAMBDA}*(h-{STAND_HEIGHT_TARGET})^2) if upright>{UPRIGHT_THRESH}")
     print(f"   Fall penalty: -{FALL_PENALTY} below {FALL_HEIGHT}m")
+    print(f"   Curriculum  : {int(CURR_PROB_INIT*100)}% -> {int(CURR_PROB_FINAL*100)}% height injection over {CURR_FADE_STEPS:,} steps")
     print()
 
     env = make_env(training=True)
@@ -303,7 +351,7 @@ def main():
         total_timesteps=remaining,
         callback=[ckpt_cb, eval_cb, std_cb, plateau_cb],
         reset_num_timesteps=False,
-        tb_log_name="ppo_stayup_v2",
+        tb_log_name="ppo_stayup_5d",
     )
     elapsed = time.time() - start
 
@@ -312,7 +360,7 @@ def main():
     env.save(final + "_vecnorm.pkl")
     print(f"\n✅ Session done in {elapsed / 60:.1f} min")
     print(f"   Model → {final}.zip")
-    print(f"\n💡 Peek  : python render.py --env HumanoidStandup-v5 --checkpoint checkpoints/phase1_5c_stayup_v2/humanoid_stayup_final --vecnormalize checkpoints/phase1_5c_stayup_v2/humanoid_stayup_final_vecnorm.pkl")
+    print(f"\n💡 Peek  : python render.py --env HumanoidStandup-v5 --checkpoint {final} --vecnormalize {final}_vecnorm.pkl")
     print(f"💡 TBoard: tensorboard --logdir {CONFIG['log_dir']}")
 
 
