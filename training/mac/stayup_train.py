@@ -2,28 +2,27 @@
 """
 ProjectRobot — Phase 1.5d: Curriculum Spawning + Exponential Reward (Anti-Exploit)
 
-FIX (2026-08-12): The exponential reward only checked instantaneous height +
-upright every frame, with no penalty for velocity. PPO found the cheap
-exploit: launch upward violently, clip through h=1.55m for a single frame,
-harvest near-peak reward mid-flight, then crash-land and ignore recovery.
-This explains why eval/mean_reward kept climbing (127k+) while the actual
-behavior got worse — hands not bracing, violent jumps, crashing, sometimes
-getting stuck on the ground unable to recover for the rest of the episode.
-
-Three changes kill this:
-  SUSTAIN1 — the exponential bonus now ramps in linearly over
-             SUSTAIN_STEPS consecutive frames spent above SUSTAIN_HEIGHT_MIN.
-             A single-frame bounce-through nets ~0 bonus; only genuinely
-             holding a standing posture ramps to full reward.
-  VEL1     — a velocity penalty (VEL_PENALTY_COEF * qvel_z^2) is subtracted
-             whenever the robot is inside the reward zone, directly punishing
-             fast ballistic motion through the target height.
-  STUCK1   — if torso height stays below FALL_HEIGHT for more than
-             STUCK_PATIENCE consecutive steps, the episode now terminates
-             early instead of burning the remaining budget lying on the floor.
+FIX (2026-08-12 v2):
+  CURR2 — CurriculumStayUpWrapper now takes curriculum_enabled param.
+          Previously curriculum height-injection ran unconditionally on
+          EVERY reset, including eval_env and render.py — meaning ~30% of
+          eval episodes (and render episodes) were silently teleporting the
+          robot's torso height, polluting eval/mean_reward numbers and
+          causing a visual "clip" glitch during rendering. Now only the
+          actual training envs get curriculum_enabled=True; eval_env and
+          render always use curriculum_enabled=False.
+  STEP1 — TOTAL_STEPS bumped 52M -> 70M. The prior 24M-step run (28M->52M)
+          completed entirely before the anti-exploit reward fix (sustain
+          requirement + velocity penalty + stuck termination) landed, so
+          it fully reinforced the jump-and-crash exploit. Render showed the
+          robot now attempts the full stand sequence (jump -> sit -> almost
+          stand) but loses balance at the top every time — exactly the
+          failure mode SUSTAIN_STEPS was designed to fix. Resuming from the
+          52M checkpoint under the corrected reward should teach it to hold
+          the top position instead of tipping over.
 
 Base: std_fixed 28M checkpoint (mean std 1.23)
-Target: 52,000,000 total steps (28M base + 24M new)
+Target: 70,000,000 total steps
 
 Run:
     python training/mac/stayup_train.py
@@ -55,7 +54,7 @@ SOURCE_VECNORM = str(
     / "humanoid_stayup_vecnormalize_28004864_steps.pkl"
 )
 
-TOTAL_STEPS = 52_000_000
+TOTAL_STEPS = 70_000_000
 
 CONFIG = {
     "env_id":        "HumanoidStandup-v5",
@@ -108,8 +107,14 @@ def get_uprightness(obs: np.ndarray) -> float:
 
 
 class CurriculumStayUpWrapper(gym.Wrapper):
-    def __init__(self, env):
+    """
+    curriculum_enabled: only True for actual training rollout envs.
+    eval_env and render.py must pass curriculum_enabled=False so height
+    injection never pollutes evaluation or visualization. (CURR2)
+    """
+    def __init__(self, env, curriculum_enabled: bool = True):
         super().__init__(env)
+        self.curriculum_enabled = curriculum_enabled
         self._steps = 0
         self._sustain_counter = 0
         self._stuck_counter = 0
@@ -122,7 +127,7 @@ class CurriculumStayUpWrapper(gym.Wrapper):
         obs, info = self.env.reset(**kwargs)
         self._sustain_counter = 0
         self._stuck_counter = 0
-        if np.random.random() < self._curr_prob():
+        if self.curriculum_enabled and np.random.random() < self._curr_prob():
             try:
                 qpos = self.env.unwrapped.data.qpos.copy()
                 qpos[2] = np.random.uniform(CURR_HEIGHT_MIN, CURR_HEIGHT_MAX)
@@ -241,7 +246,8 @@ def is_valid_checkpoint(path: str) -> bool:
 def make_env(training: bool = True) -> VecNormalize:
     n = CONFIG["n_envs"] if training else 1
     def _make():
-        return CurriculumStayUpWrapper(gym.make(CONFIG["env_id"]))
+        # CURR2: curriculum only active for real training envs, never eval
+        return CurriculumStayUpWrapper(gym.make(CONFIG["env_id"]), curriculum_enabled=training)
     env = DummyVecEnv([_make for _ in range(n)])
     return VecNormalize(env, norm_obs=True, norm_reward=training, clip_obs=10.0, training=training)
 
@@ -313,7 +319,7 @@ def load_model(env: VecNormalize):
 
 
 def main():
-    print("🤖 ProjectRobot — Phase 1.5d: Curriculum + Anti-Exploit Reward")
+    print("🤖 ProjectRobot — Phase 1.5d: Curriculum + Anti-Exploit Reward (v2)")
     print(f"   Base        : std_fixed 28M (mean std 1.23)")
     print(f"   Target      : {TOTAL_STEPS:,} total steps")
     print(f"   LR          : {CONFIG['learning_rate']} | clip: {CONFIG['clip_range']} | target_kl: {CONFIG['target_kl']}")
@@ -322,7 +328,7 @@ def main():
     print(f"   Vel penalty : {VEL_PENALTY_COEF} * qvel_z^2 (kills ballistic jump exploit)")
     print(f"   Fall penalty: -{FALL_PENALTY} below {FALL_HEIGHT}m")
     print(f"   Stuck term. : episode ends after {STUCK_PATIENCE} consecutive steps below {FALL_HEIGHT}m")
-    print(f"   Curriculum  : {int(CURR_PROB_INIT*100)}% -> {int(CURR_PROB_FINAL*100)}% height injection over {CURR_FADE_STEPS:,} steps")
+    print(f"   Curriculum  : {int(CURR_PROB_INIT*100)}% -> {int(CURR_PROB_FINAL*100)}% height injection (train envs only, never eval)")
     print()
 
     env = make_env(training=True)
