@@ -2,15 +2,14 @@
 """
 ProjectRobot — Render / Visualize a trained checkpoint 🤖🎥
 
-FIX (2026-08-12): was importing a stale wrapper class name (StandUpWrapper /
-StayUpWrapper) that no longer exists after the 1.5d refactor, causing a
-silent "could not import ... continuing without wrapper" fallback — which
-meant renders were showing the RAW HumanoidStandup-v5 env with none of our
-reward shaping, so what you watched didn't reflect true training signal.
-
-Now imports CurriculumStayUpWrapper directly from training.mac.stayup_train
-and raises loudly if that import ever breaks again, instead of silently
-degrading.
+FIX (2026-08-12 v2):
+  SLOW1 — removed manual time.sleep() pacing. MuJoCo's render_mode="human"
+          viewer already paces itself in real-time internally; stacking a
+          sleep on top was causing ~2x slowdown (ultra-slow playback).
+  CURR1 — curriculum height-injection now disabled during render via
+          curriculum_enabled=False. Previously ~30% of render episodes
+          would randomly teleport the torso to a random height at reset,
+          looking like a visual "clip" / snap glitch mid-episode.
 
 Usage:
     python render.py \\
@@ -22,7 +21,6 @@ Usage:
 
 import sys
 import argparse
-import time
 from pathlib import Path
 
 import numpy as np
@@ -49,21 +47,21 @@ def parse_args():
     p.add_argument("--vecnormalize", type=str, required=True, help="Path to VecNormalize .pkl")
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--deterministic", action="store_true", default=True)
-    p.add_argument("--fps", type=int, default=60)
     return p.parse_args()
 
 
 def make_render_env(env_id: str) -> DummyVecEnv:
     def _make():
         env = gym.make(env_id, render_mode="human")
-        return StandUpWrapper(env)
+        # CURR1: curriculum_enabled=False — never teleport height during render
+        return StandUpWrapper(env, curriculum_enabled=False)
     return DummyVecEnv([_make])
 
 
 def main():
     args = parse_args()
     print("🤖 ProjectRobot — Render")
-    print(f"   Wrapper     : CurriculumStayUpWrapper ✅ (import verified)")
+    print(f"   Wrapper     : CurriculumStayUpWrapper ✅ (import verified, curriculum disabled)")
     print(f"   Checkpoint  : {args.checkpoint}.zip")
     print(f"   VecNormalize: {args.vecnormalize}")
     print(f"   Episodes    : {args.episodes}")
@@ -89,7 +87,7 @@ def main():
             steps += 1
             raw_obs = env.get_original_obs()[0]
             max_height = max(max_height, float(raw_obs[0]))
-            time.sleep(1.0 / args.fps)
+            # SLOW1: no manual sleep — mujoco human viewer paces itself
             done = bool(done[0]) if hasattr(done, "__len__") else bool(done)
         print(f"Episode {ep}: steps={steps} total_reward={total_reward:.1f} max_height={max_height:.2f}m")
 
