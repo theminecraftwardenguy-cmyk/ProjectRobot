@@ -2,42 +2,30 @@
 """
 ProjectRobot — Render / Visualize a trained checkpoint 🤖🎥
 
-FIX (2026-08-12 v2):
-  SLOW1 — removed manual time.sleep() pacing. MuJoCo's render_mode="human"
-          viewer already paces itself in real-time internally; stacking a
-          sleep on top was causing ~2x slowdown (ultra-slow playback).
-  CURR1 — curriculum height-injection now disabled during render via
-          curriculum_enabled=False. Previously ~30% of render episodes
-          would randomly teleport the torso to a random height at reset,
-          looking like a visual "clip" / snap glitch mid-episode.
+FIX (2026-08-13): Dropped the custom wrapper dependency entirely. Our
+reward-wrapper class has been renamed three times across phases
+(StayUpWrapper -> CurriculumStayUpWrapper -> none in phase 2/3), and none
+of them affect physics or visuals — they only change the reward number
+that gets printed. Rendering the plain environment directly removes this
+fragile coupling for good; works uniformly for any checkpoint from any
+phase (1.5c, 1.5d, phase 2 baseline, phase 3 assist).
+
+Note: printed episode_reward will be the NATIVE env reward only, since no
+custom shaping wrapper is applied here. That's expected and matches what
+the phase 2/3 policies were actually trained against.
 
 Usage:
     python render.py \\
         --env HumanoidStandup-v5 \\
-        --checkpoint checkpoints/phase1_5d_stayup/humanoid_stayup_final \\
-        --vecnormalize checkpoints/phase1_5d_stayup/humanoid_stayup_final_vecnorm.pkl \\
+        --checkpoint checkpoints/phase3_assist_standup/humanoid_assist_final \\
+        --vecnormalize checkpoints/phase3_assist_standup/humanoid_assist_final_vecnorm.pkl \\
         --episodes 3
 """
 
-import sys
 import argparse
-from pathlib import Path
-
-import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-
-REPO_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(REPO_ROOT))
-
-try:
-    from training.mac.stayup_train import CurriculumStayUpWrapper as StandUpWrapper
-    WRAPPER_LOADED = True
-except ImportError as e:
-    print(f"❌ FATAL: could not import CurriculumStayUpWrapper — {e}")
-    print("   Render would silently show unwrapped behavior. Fix the import before continuing.")
-    sys.exit(1)
 
 
 def parse_args():
@@ -52,16 +40,14 @@ def parse_args():
 
 def make_render_env(env_id: str) -> DummyVecEnv:
     def _make():
-        env = gym.make(env_id, render_mode="human")
-        # CURR1: curriculum_enabled=False — never teleport height during render
-        return StandUpWrapper(env, curriculum_enabled=False)
+        return gym.make(env_id, render_mode="human")
     return DummyVecEnv([_make])
 
 
 def main():
     args = parse_args()
     print("🤖 ProjectRobot — Render")
-    print(f"   Wrapper     : CurriculumStayUpWrapper ✅ (import verified, curriculum disabled)")
+    print("   Wrapper     : none (plain env — matches phase 2/3 training)")
     print(f"   Checkpoint  : {args.checkpoint}.zip")
     print(f"   VecNormalize: {args.vecnormalize}")
     print(f"   Episodes    : {args.episodes}")
@@ -87,7 +73,6 @@ def main():
             steps += 1
             raw_obs = env.get_original_obs()[0]
             max_height = max(max_height, float(raw_obs[0]))
-            # SLOW1: no manual sleep — mujoco human viewer paces itself
             done = bool(done[0]) if hasattr(done, "__len__") else bool(done)
         print(f"Episode {ep}: steps={steps} total_reward={total_reward:.1f} max_height={max_height:.2f}m")
 
